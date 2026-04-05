@@ -4,24 +4,18 @@
 
 It is designed for an always-visible desktop widget: small footprint, fast glanceability, and no need to open Synapse just to check battery state.
 
+![BlackSharkBattery screenshot](assets/BlacksharkBattery.png)
+
 ## Features
 
 - Compact battery icon with percentage display
 - Charging indicator with vector lightning bolt
 - Stale-data indicator with question mark
 - Explicit disconnected state that preserves the last known battery reading
-- Battery color bands:
-  - `0-10%` red
-  - `11-20%` orange
-  - `21-30%` yellow
-  - `31-100%` green
+- Battery color bands: `0-10%` red, `11-20%` orange, `21-30%` yellow, `31-100%` green
 - Estimated remaining charge time based on local Synapse discharge history
 - Optional built-in preview states for live UI testing
-- Lightweight polling:
-  - a cheap log-change check runs every few seconds for fast connect/disconnect response
-  - a small lifecycle tail is only read when the live log actually changes
-  - the full current Synapse log tail is read once per minute for battery updates
-  - historical logs are rescanned on a longer interval
+- Lightweight polling with a fast lifecycle check, slower battery polling, and longer-interval history rescans
 
 ## Requirements
 
@@ -41,13 +35,19 @@ It is designed for an always-visible desktop widget: small footprint, fast glanc
 
 ## How It Works
 
-- By default, the skin reads:
-  `C:\Users\<YourUser>\AppData\Local\Razer\Synapse3\Log\Razer Synapse 3.log`
+- By default, the skin reads `C:\Users\<YourUser>\AppData\Local\Razer\Synapse3\Log\Razer Synapse 3.log`
 - It only reads the tail of the live log to stay lightweight.
 - It can react more quickly to headset on/off transitions by checking for log changes frequently, while keeping the heavier battery parse on a slower cadence.
 - Battery-time estimation uses recent and longer-term local Synapse history, with heavier weighting on recent discharge behavior.
 - Only discharge sessions are considered for the estimate.
 - Long gaps and charging transitions are filtered out so the estimate is less noisy.
+
+## Display States
+
+- Live battery with color-coded fill
+- Charging with a lightning bolt indicator
+- Stale with a `?` marker when the last reading is old
+- Disconnected with the last known battery reading preserved in grey
 
 ## Preview States
 
@@ -82,6 +82,7 @@ Preview charge-time values use the configured `PreviewFullChargeHours` baseline 
 
 - `BlackSharkBattery.ini`: Rainmeter skin definition
 - `@Resources/BlackSharkBattery.lua`: Synapse log parsing, battery-state logic, estimate logic, and preview helpers
+- `assets/BlacksharkBattery.png`: screenshot used in this README
 - `README.md`: install and usage documentation
 - `LICENSE`: repository license
 
