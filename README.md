@@ -1,6 +1,6 @@
 # Razer BlackShark V2 Pro (2023) Rainmeter Battery Skin
 
-`BlackSharkBattery` is a lightweight Rainmeter skin for the `Razer BlackShark V2 Pro (2023)` that reads battery data from the local `Razer Synapse 3` log when the headset is connected over the wireless dongle.
+`BlackShark V2 Pro (2023) Rainmeter Battery Skin` is a lightweight Rainmeter skin for the `Razer BlackShark V2 Pro (2023)` that reads battery data from the local `Razer Synapse 3` log when the headset is connected over the wireless dongle.
 
 It is designed for an always-visible desktop widget: small footprint, fast glanceability, and no need to open Synapse just to check battery state.
 
