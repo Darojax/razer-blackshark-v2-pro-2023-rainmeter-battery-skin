@@ -13,7 +13,7 @@ It is designed for an always-visible desktop widget: small footprint, fast glanc
 - Stale-data indicator with question mark
 - Explicit disconnected state that preserves the last known battery reading
 - Battery color bands: `0-10%` red, `11-20%` orange, `21-30%` yellow, `31-100%` green
-- Estimated remaining charge time based on local Synapse discharge history
+- Estimated remaining charge time based on robust local Synapse discharge history across short-, medium-, and longer-term usage
 - Optional built-in preview states for live UI testing
 - Lightweight polling with a fast lifecycle check, slower battery polling, and longer-interval history rescans
 
@@ -38,9 +38,9 @@ It is designed for an always-visible desktop widget: small footprint, fast glanc
 - By default, the skin reads `C:\Users\<YourUser>\AppData\Local\Razer\Synapse3\Log\Razer Synapse 3.log`
 - It only reads the tail of the live log to stay lightweight.
 - It can react more quickly to headset on/off transitions by checking for log changes frequently, while keeping the heavier battery parse on a slower cadence.
-- Battery-time estimation uses recent and longer-term local Synapse history, with heavier weighting on recent discharge behavior.
+- Battery-time estimation uses recent and longer-term local Synapse history, but now leans more heavily on broader history so short reconnect anomalies have less impact.
 - Only discharge sessions are considered for the estimate.
-- Long gaps and charging transitions are filtered out so the estimate is less noisy.
+- Long gaps, reconnect rebounds, and short outlier sessions are filtered out so the estimate is less sensitive to temporary percentage corrections.
 
 ## Display States
 

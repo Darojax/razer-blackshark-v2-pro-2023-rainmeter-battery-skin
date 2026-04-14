@@ -137,16 +137,20 @@ function RefreshSettings()
         lifecycleTailBytes = tonumber(SKIN:GetVariable("LifecycleTailBytes", "32768")) or 32768,
         staleMinutes = tonumber(SKIN:GetVariable("StaleMinutes", "180")) or 180,
         disconnectDebounceSeconds = tonumber(SKIN:GetVariable("DisconnectDebounceSeconds", "15")) or 15,
-        historyDays = tonumber(SKIN:GetVariable("HistoryDays", "21")) or 21,
+        historyDays = tonumber(SKIN:GetVariable("HistoryDays", "90")) or 90,
         historyRefreshHours = tonumber(SKIN:GetVariable("HistoryRefreshHours", "6")) or 6,
         yellowThreshold = yellowThreshold,
         orangeThreshold = orangeThreshold,
         redThreshold = redThreshold,
-        estimateRecentHours = tonumber(SKIN:GetVariable("EstimateRecentHours", "12")) or 12,
-        estimateMediumHours = tonumber(SKIN:GetVariable("EstimateMediumHours", "168")) or 168,
-        estimateLongHours = tonumber(SKIN:GetVariable("EstimateLongHours", "504")) or 504,
+        estimateRecentHours = tonumber(SKIN:GetVariable("EstimateRecentHours", "24")) or 24,
+        estimateMediumHours = tonumber(SKIN:GetVariable("EstimateMediumHours", "336")) or 336,
+        estimateLongHours = tonumber(SKIN:GetVariable("EstimateLongHours", "2160")) or 2160,
         estimateMaxGapHours = tonumber(SKIN:GetVariable("EstimateMaxGapHours", "3")) or 3,
         estimateMinTotalDrop = tonumber(SKIN:GetVariable("EstimateMinTotalDrop", "3")) or 3,
+        estimateMinSessionDrop = tonumber(SKIN:GetVariable("EstimateMinSessionDrop", "3")) or 3,
+        estimateMinSessionHours = tonumber(SKIN:GetVariable("EstimateMinSessionHours", "1")) or 1,
+        estimateMaxRatePerHour = tonumber(SKIN:GetVariable("EstimateMaxRatePerHour", "6")) or 6,
+        estimateOutlierRateFactor = tonumber(SKIN:GetVariable("EstimateOutlierRateFactor", "2.25")) or 2.25,
         previewFullChargeHours = tonumber(SKIN:GetVariable("PreviewFullChargeHours", "48")) or 48,
         showDeveloperPreviews = (tonumber(SKIN:GetVariable("ShowDeveloperPreviews", "0")) or 0) > 0,
         devMode = (tonumber(SKIN:GetVariable("DevMode", "0")) or 0) > 0,
@@ -601,7 +605,7 @@ end
 
 function GetEstimate(reading, isStale)
     if reading.isPreview and settings.devForceEstimateUnavailable then
-        return { available = false, reason = "insufficient_logs", text = "Estimate unavailable: not enough discharge history yet" }
+        return { available = false, reason = "insufficient_logs", text = "Estimate unavailable: not enough stable discharge history yet" }
     end
 
     if reading.isPreview then
@@ -795,57 +799,22 @@ function AppendHistoryEntry(entries, reading)
 end
 
 function CalculateDischargeRate(entries, windowHours)
-    local cutoff = os.time() - (windowHours * 3600)
-    local filtered = {}
-    for _, entry in ipairs(entries) do
-        if entry.timestamp >= cutoff then
-            table.insert(filtered, entry)
-        end
+    local sessions = CollectDischargeSessions(entries, windowHours)
+    if #sessions == 0 then
+        return nil
     end
 
-    if #filtered < 2 then
+    local filteredSessions = FilterDischargeSessions(sessions)
+    if #filteredSessions == 0 then
         return nil
     end
 
     local totalDrop = 0
     local totalHours = 0
-    local sessionStart = nil
-    local sessionLast = nil
-
-    local finalizeSession = function()
-        if sessionStart and sessionLast and sessionLast.timestamp > sessionStart.timestamp and sessionLast.percent < sessionStart.percent then
-            local drop = sessionStart.percent - sessionLast.percent
-            local hours = (sessionLast.timestamp - sessionStart.timestamp) / 3600
-            if drop > 0 and hours > 0 then
-                totalDrop = totalDrop + drop
-                totalHours = totalHours + hours
-            end
-        end
-        sessionStart = nil
-        sessionLast = nil
+    for _, session in ipairs(filteredSessions) do
+        totalDrop = totalDrop + session.drop
+        totalHours = totalHours + session.hours
     end
-
-    for _, entry in ipairs(filtered) do
-        if entry.state ~= "NotCharging" then
-            finalizeSession()
-        else
-            if not sessionStart then
-                sessionStart = entry
-                sessionLast = entry
-            else
-                local gapHours = (entry.timestamp - sessionLast.timestamp) / 3600
-                if gapHours > settings.estimateMaxGapHours or entry.percent > sessionLast.percent then
-                    finalizeSession()
-                    sessionStart = entry
-                    sessionLast = entry
-                else
-                    sessionLast = entry
-                end
-            end
-        end
-    end
-
-    finalizeSession()
 
     if totalDrop < settings.estimateMinTotalDrop or totalHours <= 0 then
         return nil
@@ -855,6 +824,8 @@ function CalculateDischargeRate(entries, windowHours)
         rate = totalDrop / totalHours,
         totalDrop = totalDrop,
         totalHours = totalHours,
+        sessionCount = #filteredSessions,
+        rawSessionCount = #sessions,
     }
 end
 
@@ -862,22 +833,168 @@ function CombineRates(recent, medium, long)
     local weightedRate = 0
     local totalWeight = 0
 
-    local function addRate(stats, weight)
-        if stats and stats.rate and stats.rate > 0 then
+    local function addRate(stats, baseWeight)
+        local confidence = GetRateConfidence(stats)
+        local weight = baseWeight * confidence
+        if stats and stats.rate and stats.rate > 0 and weight > 0 then
             weightedRate = weightedRate + (stats.rate * weight)
             totalWeight = totalWeight + weight
         end
     end
 
-    addRate(recent, 0.6)
-    addRate(medium, 0.3)
-    addRate(long, 0.1)
+    addRate(recent, 0.15)
+    addRate(medium, 0.35)
+    addRate(long, 0.50)
 
     if totalWeight <= 0 then
+        if long and long.rate and long.rate > 0 then
+            return long.rate
+        end
+        if medium and medium.rate and medium.rate > 0 then
+            return medium.rate
+        end
+        if recent and recent.rate and recent.rate > 0 then
+            return recent.rate
+        end
         return nil
     end
 
     return weightedRate / totalWeight
+end
+
+function CollectDischargeSessions(entries, windowHours)
+    local cutoff = os.time() - (windowHours * 3600)
+    local filtered = {}
+    for _, entry in ipairs(entries) do
+        if entry.timestamp >= cutoff then
+            table.insert(filtered, entry)
+        end
+    end
+
+    if #filtered < 2 then
+        return {}
+    end
+
+    local sessions = {}
+    local sessionStart = nil
+    local sessionLast = nil
+    local sessionStartReason = "initial"
+
+    local finalizeSession = function(endReason)
+        if sessionStart and sessionLast and sessionLast.timestamp > sessionStart.timestamp and sessionLast.percent < sessionStart.percent then
+            local drop = sessionStart.percent - sessionLast.percent
+            local hours = (sessionLast.timestamp - sessionStart.timestamp) / 3600
+            if drop > 0 and hours > 0 then
+                table.insert(sessions, {
+                    drop = drop,
+                    hours = hours,
+                    rate = drop / hours,
+                    startReason = sessionStartReason,
+                    endReason = endReason or "windowend",
+                })
+            end
+        end
+
+        sessionStart = nil
+        sessionLast = nil
+        sessionStartReason = "initial"
+    end
+
+    for _, entry in ipairs(filtered) do
+        if entry.state ~= "NotCharging" then
+            finalizeSession("statechange")
+        else
+            if not sessionStart then
+                sessionStart = entry
+                sessionLast = entry
+                sessionStartReason = "initial"
+            else
+                local gapHours = (entry.timestamp - sessionLast.timestamp) / 3600
+                if gapHours > settings.estimateMaxGapHours then
+                    finalizeSession("gap")
+                    sessionStart = entry
+                    sessionLast = entry
+                    sessionStartReason = "gap"
+                elseif entry.percent > sessionLast.percent then
+                    finalizeSession("increase")
+                    sessionStart = entry
+                    sessionLast = entry
+                    sessionStartReason = "increase"
+                else
+                    sessionLast = entry
+                end
+            end
+        end
+    end
+
+    finalizeSession("windowend")
+    return sessions
+end
+
+function FilterDischargeSessions(sessions)
+    local candidates = {}
+    for _, session in ipairs(sessions) do
+        if session.drop >= settings.estimateMinSessionDrop
+            and session.hours >= settings.estimateMinSessionHours
+            and session.rate > 0
+            and session.rate <= settings.estimateMaxRatePerHour then
+            table.insert(candidates, session)
+        end
+    end
+
+    if #candidates <= 1 then
+        return candidates
+    end
+
+    local medianRate = CalculateMedianRate(candidates)
+    if not medianRate or medianRate <= 0 then
+        return candidates
+    end
+
+    local threshold = math.max(settings.estimateMaxRatePerHour * 0.6, medianRate * settings.estimateOutlierRateFactor)
+    local filtered = {}
+    for _, session in ipairs(candidates) do
+        if session.rate <= threshold then
+            table.insert(filtered, session)
+        end
+    end
+
+    if #filtered == 0 then
+        return candidates
+    end
+
+    return filtered
+end
+
+function CalculateMedianRate(sessions)
+    if #sessions == 0 then
+        return nil
+    end
+
+    local rates = {}
+    for _, session in ipairs(sessions) do
+        rates[#rates + 1] = session.rate
+    end
+
+    table.sort(rates)
+    local midpoint = math.floor(#rates / 2) + 1
+    if (#rates % 2) == 1 then
+        return rates[midpoint]
+    end
+
+    return (rates[midpoint - 1] + rates[midpoint]) / 2
+end
+
+function GetRateConfidence(stats)
+    if not stats or not stats.rate or stats.rate <= 0 then
+        return 0
+    end
+
+    local dropScore = Clamp((stats.totalDrop or 0) / 12, 0, 1)
+    local hoursScore = Clamp((stats.totalHours or 0) / 12, 0, 1)
+    local sessionScore = Clamp((stats.sessionCount or 0) / 4, 0, 1)
+
+    return (dropScore * 0.35) + (hoursScore * 0.30) + (sessionScore * 0.35)
 end
 
 function FormatHours(hours)
