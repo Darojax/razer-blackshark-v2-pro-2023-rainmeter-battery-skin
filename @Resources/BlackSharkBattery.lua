@@ -486,7 +486,7 @@ function ParseV4LatestFromContent(content, devicePattern)
 end
 
 function ApplyV4ChargingInference(content, latest, devicePattern)
-    if not latest or latest.batteryState == "Charging" or latest.percent == nil or not latest.timestamp then
+    if not latest or latest.batteryState == "Charging" or IsOffState(latest.batteryState) or latest.percent == nil or not latest.timestamp then
         return
     end
 
@@ -495,7 +495,7 @@ function ApplyV4ChargingInference(content, latest, devicePattern)
 end
 
 function ApplyV4ChargingInferenceFromFiles(files, latest, devicePattern)
-    if not latest or latest.batteryState == "Charging" or latest.percent == nil or not latest.timestamp then
+    if not latest or latest.batteryState == "Charging" or IsOffState(latest.batteryState) or latest.percent == nil or not latest.timestamp then
         return
     end
 
@@ -837,6 +837,10 @@ function MapV4BatteryState(input)
         return "Charging"
     end
 
+    if input == "off" or input == "Off" then
+        return "Off"
+    end
+
     if input == "NoCharge_BatteryFull" then
         return "NotCharging"
     end
@@ -995,7 +999,9 @@ function ApplyReading(reading)
     local ageMinutes = GetAgeMinutes(reading.timestamp)
     local disconnectedInfo = GetDisconnectedInfo(reading)
     local isDisconnected = disconnectedInfo.isDisconnected
-    local displayState = isDisconnected and "Disconnected" or HumanizeBatteryState(reading.batteryState)
+    local isOff = IsOffState(reading.batteryState)
+    local disconnectedLabel = isOff and "Headset off" or "Disconnected"
+    local displayState = isDisconnected and disconnectedLabel or HumanizeBatteryState(reading.batteryState)
     local batteryColor = isDisconnected and palette.disconnected or PickBatteryColor(percent, reading.batteryState)
     local isCharging = (not isDisconnected) and IsChargingState(reading.batteryState)
     local ageText, isStale
@@ -1006,13 +1012,13 @@ function ApplyReading(reading)
         ageText, isStale = BuildAgeText(ageMinutes, settings.staleMinutes)
     end
     if isDisconnected then
-        ageText = string.format("Disconnected at %s", disconnectedInfo.timestampText)
+        ageText = string.format("%s at %s", disconnectedLabel, disconnectedInfo.timestampText)
         isStale = false
     end
     local outlineColor = isDisconnected and palette.disconnected or (isStale and palette.stale or batteryColor)
     local fillWidth = math.floor((percent / 100) * settings.fillMaxWidth + 0.5)
     local estimate = isDisconnected
-        and { available = false, reason = "disconnected", text = "Headset disconnected; showing last known battery" }
+        and { available = false, reason = isOff and "off" or "disconnected", text = isOff and "Headset off; showing last known battery" or "Headset disconnected; showing last known battery" }
         or GetEstimate(reading, isStale)
 
     state.value = percent
@@ -1036,9 +1042,9 @@ function ApplyReading(reading)
     SetVariable("EstimateDisplay", BuildEstimateDisplay(estimate))
     if isDisconnected then
         if reading.isPreview then
-            SetVariable("BatteryTooltip", string.format("%d%%\nDisconnected\n%s\nShowing last known battery", percent, reading.timestampText))
+            SetVariable("BatteryTooltip", string.format("%d%%\n%s\n%s\nShowing last known battery", percent, disconnectedLabel, reading.timestampText))
         else
-            SetVariable("BatteryTooltip", string.format("%d%%\nDisconnected\nDisconnected: %s\nLast battery reading: %s\nLog file: %s", percent, disconnectedInfo.timestampText, reading.timestampText, settings.logFile))
+            SetVariable("BatteryTooltip", string.format("%d%%\n%s\n%s: %s\nLast battery reading: %s\nLog file: %s", percent, disconnectedLabel, disconnectedLabel, disconnectedInfo.timestampText, reading.timestampText, settings.logFile))
         end
     elseif reading.isPreview then
         SetVariable("BatteryTooltip", string.format("%d%%\n%s\n%s\n%s", percent, displayState, ageText, estimate.text))
@@ -1711,6 +1717,10 @@ end
 
 function BuildEstimateDisplay(estimate)
     if not estimate or not estimate.available or not estimate.hours then
+        if estimate and estimate.reason == "off" then
+            return "Headset off"
+        end
+
         if estimate and estimate.reason == "disconnected" then
             return "Disconnected"
         end
@@ -1791,6 +1801,20 @@ function GetDisconnectedInfo(reading)
             isDisconnected = true,
             timestamp = os.time(),
             timestampText = "Developer preview",
+        }
+    end
+
+    if IsOffState(reading.batteryState) then
+        local offTimestamp = reading.timestamp or os.time()
+        local offAgeSeconds = os.difftime(os.time(), offTimestamp)
+        if offAgeSeconds < math.max(0, settings.disconnectDebounceSeconds or 0) then
+            return { isDisconnected = false }
+        end
+
+        return {
+            isDisconnected = true,
+            timestamp = offTimestamp,
+            timestampText = reading.timestampText or FormatExactTimestamp(offTimestamp),
         }
     end
 
@@ -2011,6 +2035,11 @@ end
 function IsChargingState(batteryState)
     local normalizedState = string.lower(batteryState or "")
     return normalizedState == "charging"
+end
+
+function IsOffState(batteryState)
+    local normalizedState = string.lower(batteryState or "")
+    return normalizedState == "off"
 end
 
 function HumanizeBatteryState(input)

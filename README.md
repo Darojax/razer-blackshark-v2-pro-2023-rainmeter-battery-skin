@@ -41,6 +41,7 @@ It is designed for an always-visible desktop widget: small footprint, fast glanc
 - It only reads the tail of the live log to stay lightweight.
 - For Synapse 4, it scans all discovered `systray_systrayv2*.log` files and uses the newest headset snapshot found.
 - Synapse 4 can report `NoCharge_BatteryFull` even when the headset is not full, so the skin can infer charging from a recent rising battery percentage using `Synapse4ChargingInferenceHours`.
+- Synapse 4 `off` readings are treated as an offline headset state rather than as a live non-charging battery reading.
 - It can react more quickly to headset on/off transitions by checking for log changes frequently, while keeping the heavier battery parse on a slower cadence.
 - Battery-time estimation uses recent and longer-term local Synapse history, but now leans more heavily on broader history so short reconnect anomalies have less impact.
 - Only discharge sessions are considered for the estimate.
@@ -52,6 +53,7 @@ It is designed for an always-visible desktop widget: small footprint, fast glanc
 - Charging with a lightning bolt indicator
 - Stale with a `?` marker when the last reading is old
 - Disconnected with the last known battery reading preserved in grey
+- Headset off with the last known battery reading preserved in grey
 
 ## Preview States
 
@@ -77,6 +79,7 @@ Preview charge-time values use the configured `PreviewFullChargeHours` baseline 
 
 - `Stale` means the last Synapse battery reading is older than the configured `StaleMinutes` threshold.
 - `Disconnected` means Synapse reported the headset as removed or absent from the latest live device snapshot. In that state, the widget keeps the last known battery value but greys the whole display and replaces the lower line with `Disconnected`.
+- `Headset off` means Synapse 4 reported the headset power state as `off`. In that state, the widget keeps the last known battery value but greys the whole display.
 - When there is not enough discharge history yet, the widget displays `Charge left: Insufficient logs`.
 - Live stale readings are marked as uncertain and do not show a live estimate.
 - Left-click the widget to force a refresh.
