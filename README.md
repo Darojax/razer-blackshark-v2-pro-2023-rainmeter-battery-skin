@@ -1,6 +1,6 @@
 # Razer BlackShark V2 Pro (2023) Rainmeter Battery Skin
 
-`BlackShark V2 Pro (2023) Rainmeter Battery Skin` is a lightweight Rainmeter skin for the `Razer BlackShark V2 Pro (2023)` that reads battery data from the local `Razer Synapse 3` log when the headset is connected over the wireless dongle.
+`BlackShark V2 Pro (2023) Rainmeter Battery Skin` is a lightweight Rainmeter skin for the `Razer BlackShark V2 Pro (2023)` that reads battery data from the local `Razer Synapse 3` or `Razer Synapse 4` logs when the headset is connected over the wireless dongle.
 
 It is designed for an always-visible desktop widget: small footprint, fast glanceability, and no need to open Synapse just to check battery state.
 
@@ -21,7 +21,7 @@ It is designed for an always-visible desktop widget: small footprint, fast glanc
 
 - Windows
 - Rainmeter
-- Razer Synapse 3
+- Razer Synapse 3 or 4
 - At least one Synapse battery entry for the headset
 
 ## Install
@@ -35,7 +35,9 @@ It is designed for an always-visible desktop widget: small footprint, fast glanc
 
 ## How It Works
 
-- By default, the skin reads `C:\Users\<YourUser>\AppData\Local\Razer\Synapse3\Log\Razer Synapse 3.log`
+- By default, the skin auto-detects the active Synapse log source:
+  - `C:\Users\<YourUser>\AppData\Local\Razer\Synapse3\Log\Razer Synapse 3.log` for Synapse 3
+  - `C:\Users\<YourUser>\AppData\Local\Razer\RazerAppEngine\User Data\Logs\systray_systrayv2*.log` for Synapse 4
 - It only reads the tail of the live log to stay lightweight.
 - It can react more quickly to headset on/off transitions by checking for log changes frequently, while keeping the heavier battery parse on a slower cadence.
 - Battery-time estimation uses recent and longer-term local Synapse history, but now leans more heavily on broader history so short reconnect anomalies have less impact.
@@ -72,7 +74,7 @@ Preview charge-time values use the configured `PreviewFullChargeHours` baseline 
 ## Notes
 
 - `Stale` means the last Synapse battery reading is older than the configured `StaleMinutes` threshold.
-- `Disconnected` means Synapse logged an explicit headset removal event. In that state, the widget keeps the last known battery value but greys the whole display and replaces the lower line with `Disconnected`.
+- `Disconnected` means Synapse reported the headset as removed or absent from the latest live device snapshot. In that state, the widget keeps the last known battery value but greys the whole display and replaces the lower line with `Disconnected`.
 - When there is not enough discharge history yet, the widget displays `Charge left: Insufficient logs`.
 - Live stale readings are marked as uncertain and do not show a live estimate.
 - Left-click the widget to force a refresh.

@@ -68,10 +68,23 @@ function RefreshNow()
     if settings.devMode then
         reading = BuildPreviewReading()
     else
-        reading = ReadLatestBattery(settings.logFile, settings.devicePattern, settings.tailBytes)
+        reading = ReadLatestBattery(settings.logFile, settings.devicePattern, settings.tailBytes, settings.logSource)
     end
 
-    if reading then
+    if reading and reading.present == false and state.lastReading then
+        local quickReading = CloneReading(state.lastReading)
+        if quickReading then
+            quickReading.lifecycleEvent = {
+                status = "disconnected",
+                timestamp = reading.timestamp,
+                timestampText = reading.timestampText,
+                order = reading.order,
+            }
+            ApplyReading(quickReading)
+        else
+            SetMissingState("No Synapse battery entry", "Open Synapse once with the headset connected")
+        end
+    elseif reading then
         ApplyReading(reading)
     else
         SetMissingState("No Synapse battery entry", "Open Synapse once with the headset connected")
@@ -121,15 +134,32 @@ end
 
 function RefreshSettings()
     local localAppData = os.getenv("LOCALAPPDATA") or ""
-    local resolvedFolder = localAppData ~= "" and (localAppData .. "\\Razer\\Synapse3\\Log\\") or ""
-    local resolvedFile = resolvedFolder ~= "" and (resolvedFolder .. "Razer Synapse 3.log") or ""
+    local synapse3Folder = localAppData ~= "" and (localAppData .. "\\Razer\\Synapse3\\Log\\") or ""
+    local synapse3File = synapse3Folder ~= "" and (synapse3Folder .. "Razer Synapse 3.log") or ""
+    local synapse4Folder = localAppData ~= "" and (localAppData .. "\\Razer\\RazerAppEngine\\User Data\\Logs\\") or ""
+    local synapse4File = FindLatestSynapse4LogFile(synapse4Folder)
+    local configuredLogFolder = ResolvePathVariable(SKIN:GetVariable("LogFolder", ""), "")
+    local configuredLogFile = ResolvePathVariable(SKIN:GetVariable("LogFile", ""), "")
+    local resolvedLogFolder, resolvedLogFile, resolvedLogSource = ResolveLogTarget(
+        configuredLogFolder,
+        configuredLogFile,
+        synapse3Folder,
+        synapse3File,
+        synapse4Folder,
+        synapse4File
+    )
     local yellowThreshold = Clamp(tonumber(SKIN:GetVariable("YellowThreshold", "30")) or 30, 0, 100)
     local orangeThreshold = Clamp(tonumber(SKIN:GetVariable("OrangeThreshold", "20")) or 20, 0, yellowThreshold)
     local redThreshold = Clamp(tonumber(SKIN:GetVariable("RedThreshold", "10")) or 10, 0, orangeThreshold)
 
     settings = {
-        logFolder = ResolvePathVariable(SKIN:GetVariable("LogFolder"), resolvedFolder),
-        logFile = ResolvePathVariable(SKIN:GetVariable("LogFile"), resolvedFile),
+        logFolder = resolvedLogFolder,
+        logFile = resolvedLogFile,
+        logSource = resolvedLogSource,
+        synapse3Folder = synapse3Folder,
+        synapse3File = synapse3File,
+        synapse4Folder = synapse4Folder,
+        synapse4File = synapse4File,
         devicePattern = string.lower(SKIN:GetVariable("DevicePattern", "BlackShark V2 Pro")),
         tailBytes = tonumber(SKIN:GetVariable("TailBytes", "524288")) or 524288,
         pollSeconds = tonumber(SKIN:GetVariable("PollSeconds", "60")) or 60,
@@ -269,7 +299,15 @@ function IsStalePreset(preset)
     return preset == "stale" or preset:find("^stale") ~= nil
 end
 
-function ReadLatestBattery(path, devicePattern, tailBytes)
+function ReadLatestBattery(path, devicePattern, tailBytes, logSource)
+    if IsSynapse4Source(path, logSource) then
+        return ReadLatestBatteryV4(path, devicePattern, tailBytes)
+    end
+
+    return ReadLatestBatteryV3(path, devicePattern, tailBytes)
+end
+
+function ReadLatestBatteryV3(path, devicePattern, tailBytes)
     local content = ReadTail(path, tailBytes)
     if not content or content == "" then
         return nil
@@ -293,31 +331,9 @@ function ReadLatestBattery(path, devicePattern, tailBytes)
                     latestLifecycle = lifecycleEvent
                 end
 
-                if line:find("Battery Get By Device Handle:", 1, true) then
-                    local timestamp = ParseTimestamp(line)
-                    if timestamp then
-                        current = {
-                            timestamp = timestamp,
-                            timestampText = FormatExactTimestamp(timestamp),
-                            order = lineIndex,
-                        }
-                    end
-                end
+                current = BeginBatteryReading(line, lineIndex)
             elseif current then
-                local name = line:match("^Name:%s*(.+)$")
-                if name and not current.name then
-                    current.name = name
-                end
-
-                local percent = line:match("^Battery Percentage:%s*(%d+)$")
-                if percent then
-                    current.percent = tonumber(percent)
-                end
-
-                local batteryState = line:match("^Battery State:%s*(%S+)$")
-                if batteryState then
-                    current.batteryState = batteryState
-                end
+                ApplyBatteryReadingLine(current, line)
             end
         end
     end
@@ -327,6 +343,300 @@ function ReadLatestBattery(path, devicePattern, tailBytes)
         latest.lifecycleEvent = latestLifecycle
     end
     return latest
+end
+
+function ReadLatestBatteryV4(path, devicePattern, tailBytes)
+    local content = ReadAll(path)
+    if not content or content == "" then
+        return nil
+    end
+
+    content = content:gsub("\r\n", "\n")
+    local directLatest = ParseV4LatestFromContent(content, devicePattern)
+    if directLatest then
+        return directLatest
+    end
+
+    local latest = nil
+    local latestSnapshot = nil
+    local lineIndex = 0
+
+    for line in content:gmatch("([^\n]*)\n?") do
+        lineIndex = lineIndex + 1
+        if line ~= "" then
+            local snapshot = ParseV4Snapshot(line, devicePattern, lineIndex)
+            if snapshot then
+                latestSnapshot = snapshot
+                if snapshot.reading then
+                    latest = snapshot.reading
+                end
+            end
+        end
+    end
+
+    if latestSnapshot and not latestSnapshot.hasDevice then
+        if (not latest) or latestSnapshot.timestamp > (latest.timestamp or 0)
+            or (latestSnapshot.timestamp == (latest.timestamp or 0) and latestSnapshot.order > (latest.order or 0)) then
+            return {
+                present = false,
+                timestamp = latestSnapshot.timestamp,
+                timestampText = latestSnapshot.timestampText,
+                order = latestSnapshot.order,
+            }
+        end
+    end
+
+    return latest
+end
+
+function ParseV4LatestFromContent(content, devicePattern)
+    local loweredContent = string.lower(content or "")
+    local lastIndex = FindLastPlain(loweredContent, devicePattern)
+    if not lastIndex then
+        return nil
+    end
+
+    local lineStart = lastIndex
+    while lineStart > 1 and content:sub(lineStart - 1, lineStart - 1) ~= "\n" do
+        lineStart = lineStart - 1
+    end
+
+    local lineEnd = lastIndex
+    while lineEnd <= #content and content:sub(lineEnd, lineEnd) ~= "\n" do
+        lineEnd = lineEnd + 1
+    end
+
+    local line = content:sub(lineStart, lineEnd - 1)
+    local timestampText = line:match("^%[([^%]]+)%]")
+    local timestamp = timestampText and ParseTimestamp("[" .. timestampText .. "]") or nil
+    local name = DecodeJsonString(line:match("\"name\"%s*:%s*{%s*\"en\"%s*:%s*\"([^\"]+)\""))
+    local productName = DecodeJsonString(line:match("\"productName\"%s*:%s*{%s*\"en\"%s*:%s*\"([^\"]+)\""))
+    local chargingStatus, level = line:match("\"powerStatus\"%s*:%s*{%s*\"chargingStatus\"%s*:%s*\"([^\"]+)\"%s*,%s*\"level\"%s*:%s*(%d+)")
+
+    if not timestamp or not level or not chargingStatus then
+        return nil
+    end
+
+    return {
+        timestamp = timestamp,
+        timestampText = FormatExactTimestamp(timestamp),
+        order = 0,
+        name = name or productName or "Razer Device",
+        percent = tonumber(level),
+        batteryState = MapV4BatteryState(chargingStatus),
+    }
+end
+
+function FindLastPlain(text, needle)
+    if not text or not needle or needle == "" then
+        return nil
+    end
+
+    local startIndex = 1
+    local lastIndex = nil
+    while true do
+        local foundIndex = string.find(text, needle, startIndex, true)
+        if not foundIndex then
+            break
+        end
+        lastIndex = foundIndex
+        startIndex = foundIndex + 1
+    end
+
+    return lastIndex
+end
+
+function ParseV4Snapshot(line, devicePattern, lineIndex)
+    local timestampText, json = line:match("^%[([^%]]+)%].-connectingDeviceData:%s*(.+)$")
+    if not timestampText or not json then
+        return nil
+    end
+
+    local timestamp = ParseTimestamp("[" .. timestampText .. "]")
+    if not timestamp then
+        return nil
+    end
+
+    local directReading = ParseV4LineDirect(json, devicePattern, timestamp, lineIndex)
+    if directReading then
+        return {
+            timestamp = timestamp,
+            timestampText = directReading.timestampText,
+            order = lineIndex,
+            hasDevice = true,
+            reading = directReading,
+        }
+    end
+
+    local objects = SplitTopLevelJsonObjects(json)
+    if #objects == 0 then
+        return {
+            timestamp = timestamp,
+            timestampText = FormatExactTimestamp(timestamp),
+            order = lineIndex,
+            hasDevice = false,
+        }
+    end
+
+    for _, objectText in ipairs(objects) do
+        local reading = ParseV4DeviceReading(objectText, devicePattern, timestamp, lineIndex)
+        if reading then
+            return {
+                timestamp = timestamp,
+                timestampText = reading.timestampText,
+                order = lineIndex,
+                hasDevice = true,
+                reading = reading,
+            }
+        end
+    end
+
+    return {
+        timestamp = timestamp,
+        timestampText = FormatExactTimestamp(timestamp),
+        order = lineIndex,
+        hasDevice = false,
+    }
+end
+
+function ParseV4LineDirect(json, devicePattern, timestamp, lineIndex)
+    local loweredJson = string.lower(json or "")
+    if loweredJson == "" or not string.find(loweredJson, devicePattern, 1, true) then
+        return nil
+    end
+
+    if not json:find("\"hasBattery\"%s*:%s*true") then
+        return nil
+    end
+
+    local name = DecodeJsonString(json:match("\"name\"%s*:%s*{%s*\"en\"%s*:%s*\"([^\"]+)\""))
+    local productName = DecodeJsonString(json:match("\"productName\"%s*:%s*{%s*\"en\"%s*:%s*\"([^\"]+)\""))
+    local chargingStatus, level = json:match("\"powerStatus\"%s*:%s*{%s*\"chargingStatus\"%s*:%s*\"([^\"]+)\"%s*,%s*\"level\"%s*:%s*(%d+)")
+
+    if not level or not chargingStatus then
+        return nil
+    end
+
+    local loweredName = string.lower(name or "")
+    local loweredProductName = string.lower(productName or "")
+    if not string.find(loweredName, devicePattern, 1, true)
+        and not string.find(loweredProductName, devicePattern, 1, true) then
+        return nil
+    end
+
+    return {
+        timestamp = timestamp,
+        timestampText = FormatExactTimestamp(timestamp),
+        order = lineIndex,
+        name = name or productName or "Razer Device",
+        percent = tonumber(level),
+        batteryState = MapV4BatteryState(chargingStatus),
+    }
+end
+
+function SplitTopLevelJsonObjects(json)
+    local objects = {}
+    if not json or json == "" then
+        return objects
+    end
+
+    local depth = 0
+    local startIndex = nil
+    local inString = false
+    local isEscaped = false
+
+    for i = 1, #json do
+        local char = json:sub(i, i)
+        if inString then
+            if isEscaped then
+                isEscaped = false
+            elseif char == "\\" then
+                isEscaped = true
+            elseif char == "\"" then
+                inString = false
+            end
+        else
+            if char == "\"" then
+                inString = true
+            elseif char == "{" then
+                depth = depth + 1
+                if depth == 1 then
+                    startIndex = i
+                end
+            elseif char == "}" then
+                if depth == 1 and startIndex then
+                    table.insert(objects, json:sub(startIndex, i))
+                    startIndex = nil
+                end
+
+                if depth > 0 then
+                    depth = depth - 1
+                end
+            end
+        end
+    end
+
+    return objects
+end
+
+function ParseV4DeviceReading(objectText, devicePattern, timestamp, lineIndex)
+    if not objectText:find("\"hasBattery\"%s*:%s*true") then
+        return nil
+    end
+
+    local name = ExtractLocalizedName(objectText, "name")
+    local productName = ExtractLocalizedName(objectText, "productName")
+    local displayName = name or productName
+    local loweredName = string.lower(displayName or "")
+    local loweredProductName = string.lower(productName or "")
+    if loweredName == "" and loweredProductName == "" then
+        return nil
+    end
+
+    if not string.find(loweredName, devicePattern, 1, true)
+        and not string.find(loweredProductName, devicePattern, 1, true) then
+        return nil
+    end
+
+    local level = objectText:match("\"level\"%s*:%s*(%d+)")
+    local chargingStatus = objectText:match("\"chargingStatus\"%s*:%s*\"([^\"]+)\"")
+    if not level or not chargingStatus then
+        return nil
+    end
+
+    return {
+        timestamp = timestamp,
+        timestampText = FormatExactTimestamp(timestamp),
+        order = lineIndex,
+        name = displayName or productName,
+        percent = tonumber(level),
+        batteryState = MapV4BatteryState(chargingStatus),
+    }
+end
+
+function ExtractLocalizedName(objectText, fieldName)
+    local fieldPattern = "\"" .. fieldName .. "\"%s*:%s*(%b{})"
+    local fieldObject = objectText:match(fieldPattern)
+    if not fieldObject then
+        return nil
+    end
+
+    return DecodeJsonString(fieldObject:match("\"en\"%s*:%s*\"([^\"]+)\""))
+end
+
+function DecodeJsonString(value)
+    if not value then
+        return nil
+    end
+
+    value = value:gsub("\\\\", "\1")
+    value = value:gsub("\\\"", "\"")
+    value = value:gsub("\\/", "/")
+    value = value:gsub("\\n", " ")
+    value = value:gsub("\\r", " ")
+    value = value:gsub("\\t", " ")
+    value = value:gsub("\1", "\\")
+    return value
 end
 
 function CommitReading(latest, current, devicePattern)
@@ -339,6 +649,76 @@ function CommitReading(latest, current, devicePattern)
     end
 
     return current
+end
+
+function BeginBatteryReading(line, lineIndex)
+    local timestamp = ParseTimestamp(line)
+    if not timestamp then
+        return nil
+    end
+
+    if line:find("Battery Get By Device Handle:", 1, true) then
+        return {
+            timestamp = timestamp,
+            timestampText = FormatExactTimestamp(timestamp),
+            order = lineIndex,
+        }
+    end
+
+    local inlineName = line:match("_OnBatteryLevelChanged:%s*device Name:%s*(.+)$")
+    if inlineName then
+        return {
+            timestamp = timestamp,
+            timestampText = FormatExactTimestamp(timestamp),
+            order = lineIndex,
+            name = inlineName,
+        }
+    end
+
+    return nil
+end
+
+function ApplyBatteryReadingLine(current, line)
+    local name = line:match("^Name:%s*(.+)$")
+    if name and not current.name then
+        current.name = name
+    end
+
+    local percent = line:match("^Battery Percentage:%s*(%d+)$")
+    if percent then
+        current.percent = tonumber(percent)
+    end
+
+    local batteryState = line:match("^Battery State:%s*(%S+)$")
+    if batteryState then
+        current.batteryState = batteryState
+    end
+
+    local numericPercent, numericState = line:match("^Id:%s*%d+ level (%d+) state (%d+)$")
+    if numericPercent then
+        current.percent = tonumber(numericPercent)
+        current.batteryState = MapNumericBatteryState(tonumber(numericState))
+    end
+end
+
+function MapNumericBatteryState(input)
+    if input == 1 then
+        return "Charging"
+    end
+
+    return "NotCharging"
+end
+
+function MapV4BatteryState(input)
+    if input == "Charging" then
+        return "Charging"
+    end
+
+    if input == "NoCharge_BatteryFull" then
+        return "NotCharging"
+    end
+
+    return "NotCharging"
 end
 
 function ParseLifecycleEvent(line, devicePattern, order)
@@ -375,6 +755,14 @@ function ParseLifecycleEvent(line, devicePattern, order)
 end
 
 function ReadLatestLifecycleEvent(path, devicePattern, tailBytes)
+    if IsSynapse4Source(path, settings and settings.logSource) then
+        return ReadLatestLifecycleEventV4(path, devicePattern, tailBytes)
+    end
+
+    return ReadLatestLifecycleEventV3(path, devicePattern, tailBytes)
+end
+
+function ReadLatestLifecycleEventV3(path, devicePattern, tailBytes)
     local content = ReadTail(path, tailBytes)
     if not content or content == "" then
         return nil
@@ -395,6 +783,44 @@ function ReadLatestLifecycleEvent(path, devicePattern, tailBytes)
     end
 
     return latestLifecycle
+end
+
+function ReadLatestLifecycleEventV4(path, devicePattern, tailBytes)
+    local snapshot = ReadLatestBatteryV4(path, devicePattern, tailBytes)
+    if not snapshot then
+        return nil
+    end
+
+    if snapshot.present == false then
+        return {
+            status = "disconnected",
+            timestamp = snapshot.timestamp,
+            timestampText = snapshot.timestampText,
+            order = snapshot.order or 0,
+        }
+    end
+
+    return {
+        status = "connected",
+        timestamp = snapshot.timestamp,
+        timestampText = snapshot.timestampText,
+        order = snapshot.order or 0,
+    }
+end
+
+function ReadAll(path)
+    if not path or path == "" then
+        return nil
+    end
+
+    local file = io.open(path, "rb")
+    if not file then
+        return nil
+    end
+
+    local content = file:read("*a")
+    file:close()
+    return content
 end
 
 function CloneLifecycleEvent(event)
@@ -624,7 +1050,12 @@ function GetEstimate(reading, isStale)
     EnsureHistoryEntries(reading)
     local entries = state.historyEntries or {}
     if #entries < 3 then
-        return { available = false, reason = "insufficient_logs", text = "Estimate unavailable: collecting discharge history" }
+        local preliminary = GetPreliminaryEstimate(entries, reading)
+        if preliminary then
+            return preliminary
+        end
+
+        return GetBaselineEstimate(reading)
     end
 
     local recent = CalculateDischargeRate(entries, settings.estimateRecentHours)
@@ -632,7 +1063,12 @@ function GetEstimate(reading, isStale)
     local long = CalculateDischargeRate(entries, settings.estimateLongHours)
     local rate = CombineRates(recent, medium, long)
     if not rate or rate <= 0 then
-        return { available = false, reason = "insufficient_logs", text = "Estimate unavailable: not enough discharge history yet" }
+        local preliminary = GetPreliminaryEstimate(entries, reading)
+        if preliminary then
+            return preliminary
+        end
+
+        return GetBaselineEstimate(reading)
     end
 
     local hoursRemaining = reading.percent / rate
@@ -641,6 +1077,43 @@ function GetEstimate(reading, isStale)
         hours = hoursRemaining,
         rate = rate,
         text = string.format("Estimated battery use left: ~%s", FormatHours(hoursRemaining)),
+    }
+end
+
+function GetPreliminaryEstimate(entries, reading)
+    if not entries or #entries < 2 or not reading or reading.percent == nil then
+        return nil
+    end
+
+    local recent = CalculatePreliminaryDischargeRate(entries, settings.estimateRecentHours)
+    local medium = CalculatePreliminaryDischargeRate(entries, settings.estimateMediumHours)
+    local long = CalculatePreliminaryDischargeRate(entries, settings.estimateLongHours)
+    local rate = CombineRates(recent, medium, long)
+    if not rate or rate <= 0 then
+        return nil
+    end
+
+    local hoursRemaining = reading.percent / rate
+    return {
+        available = true,
+        hours = hoursRemaining,
+        rate = rate,
+        preliminary = true,
+        text = string.format("Preliminary charge estimate: ~%s", FormatHours(hoursRemaining)),
+    }
+end
+
+function GetBaselineEstimate(reading)
+    local fullHours = math.max(1, settings.previewFullChargeHours or 48)
+    local percent = Clamp(reading.percent or 0, 0, 100)
+    local hoursRemaining = (percent / 100) * fullHours
+
+    return {
+        available = true,
+        hours = hoursRemaining,
+        baseline = true,
+        preliminary = true,
+        text = string.format("Baseline charge estimate: ~%s", FormatHours(hoursRemaining)),
     }
 end
 
@@ -681,6 +1154,14 @@ function LoadHistoryEntries()
 end
 
 function GatherHistoryFiles()
+    if settings.logSource == "synapse4" then
+        return GatherHistoryFilesV4()
+    end
+
+    return GatherHistoryFilesV3()
+end
+
+function GatherHistoryFilesV3()
     local files = {}
     if FileExists(settings.logFile) then
         table.insert(files, settings.logFile)
@@ -706,7 +1187,38 @@ function GatherHistoryFiles()
     return files
 end
 
+function GatherHistoryFilesV4()
+    local files = {}
+    local folder = settings.synapse4Folder or settings.logFolder or ""
+    if folder == "" then
+        if FileExists(settings.logFile) then
+            table.insert(files, settings.logFile)
+        end
+        return files
+    end
+
+    for _, path in ipairs(FindSynapse4LogFiles(folder)) do
+        if FileExists(path) then
+            table.insert(files, path)
+        end
+    end
+
+    if #files == 0 and FileExists(settings.logFile) then
+        table.insert(files, settings.logFile)
+    end
+
+    return files
+end
+
 function ParseHistoryFile(path, cutoffTimestamp, entries, seen)
+    if IsSynapse4Source(path, settings and settings.logSource) then
+        return ParseHistoryFileV4(path, cutoffTimestamp, entries, seen)
+    end
+
+    return ParseHistoryFileV3(path, cutoffTimestamp, entries, seen)
+end
+
+function ParseHistoryFileV3(path, cutoffTimestamp, entries, seen)
     local file = io.open(path, "rb")
     if not file then
         return
@@ -727,32 +1239,60 @@ function ParseHistoryFile(path, cutoffTimestamp, entries, seen)
                 CommitHistoryEntry(entries, seen, current, cutoffTimestamp)
                 current = nil
 
-                if line:find("Battery Get By Device Handle:", 1, true) then
-                    local timestamp = ParseTimestamp(line)
-                    if timestamp and timestamp >= cutoffTimestamp then
-                        current = { timestamp = timestamp }
-                    end
-                end
+                current = BeginHistoryBatteryReading(line, cutoffTimestamp)
             elseif current then
-                local name = line:match("^Name:%s*(.+)$")
-                if name and not current.name then
-                    current.name = name
-                end
-
-                local percent = line:match("^Battery Percentage:%s*(%d+)$")
-                if percent then
-                    current.percent = tonumber(percent)
-                end
-
-                local batteryState = line:match("^Battery State:%s*(%S+)$")
-                if batteryState then
-                    current.batteryState = batteryState
-                end
+                ApplyBatteryReadingLine(current, line)
             end
         end
     end
 
     CommitHistoryEntry(entries, seen, current, cutoffTimestamp)
+end
+
+function ParseHistoryFileV4(path, cutoffTimestamp, entries, seen)
+    local file = io.open(path, "rb")
+    if not file then
+        return
+    end
+
+    local content = file:read("*a")
+    file:close()
+    if not content or content == "" then
+        return
+    end
+
+    content = content:gsub("\r\n", "\n")
+    local lastKey = nil
+
+    for line in content:gmatch("([^\n]*)\n?") do
+        if line ~= "" then
+            local snapshot = ParseV4Snapshot(line, settings.devicePattern, 0)
+            if snapshot and snapshot.reading then
+                local reading = snapshot.reading
+                if reading.timestamp >= cutoffTimestamp then
+                    local key = string.format("%d|%d|%s", reading.timestamp, reading.percent, reading.batteryState)
+                    if key ~= lastKey and not seen[key] then
+                        seen[key] = true
+                        lastKey = key
+                        table.insert(entries, {
+                            timestamp = reading.timestamp,
+                            percent = reading.percent,
+                            state = reading.batteryState,
+                        })
+                    end
+                end
+            end
+        end
+    end
+end
+
+function BeginHistoryBatteryReading(line, cutoffTimestamp)
+    local reading = BeginBatteryReading(line, 0)
+    if not reading or not reading.timestamp or reading.timestamp < cutoffTimestamp then
+        return nil
+    end
+
+    return { timestamp = reading.timestamp, name = reading.name }
 end
 
 function CommitHistoryEntry(entries, seen, current, cutoffTimestamp)
@@ -825,6 +1365,39 @@ function CalculateDischargeRate(entries, windowHours)
         totalDrop = totalDrop,
         totalHours = totalHours,
         sessionCount = #filteredSessions,
+        rawSessionCount = #sessions,
+    }
+end
+
+function CalculatePreliminaryDischargeRate(entries, windowHours)
+    local sessions = CollectDischargeSessions(entries, windowHours)
+    if #sessions == 0 then
+        return nil
+    end
+
+    local totalDrop = 0
+    local totalHours = 0
+    local sessionCount = 0
+    for _, session in ipairs(sessions) do
+        if session.drop >= 1
+            and session.hours >= 0.20
+            and session.rate > 0
+            and session.rate <= math.max(12, settings.estimateMaxRatePerHour * 2) then
+            totalDrop = totalDrop + session.drop
+            totalHours = totalHours + session.hours
+            sessionCount = sessionCount + 1
+        end
+    end
+
+    if totalDrop < 1 or totalHours <= 0 or sessionCount == 0 then
+        return nil
+    end
+
+    return {
+        rate = totalDrop / totalHours,
+        totalDrop = totalDrop,
+        totalHours = totalHours,
+        sessionCount = sessionCount,
         rawSessionCount = #sessions,
     }
 end
@@ -1026,6 +1599,10 @@ function BuildEstimateDisplay(estimate)
         return "Charge left: ~--:--"
     end
 
+    if estimate.preliminary then
+        return string.format("Charge left: ~%s?", FormatEstimateDuration(estimate.hours))
+    end
+
     return string.format("Charge left: ~%s", FormatEstimateDuration(estimate.hours))
 end
 
@@ -1210,12 +1787,23 @@ end
 
 function IsTimestampLine(line)
     return line:match("^%d%d%d%d%-%d%d%-%d%d %d%d:%d%d:%d%d") ~= nil
+        or line:match("^%d%d%d%d/%d%d/%d%d %d%d:%d%d:%d%d") ~= nil
+        or line:match("^%[[^%]]+%].-connectingDeviceData:") ~= nil
 end
 
 function ParseTimestamp(line)
     local year, month, day, hour, min, sec = line:match("^(%d%d%d%d)%-(%d%d)%-(%d%d) (%d%d):(%d%d):(%d%d)")
     if not year then
-        return nil
+        year, month, day, hour, min, sec = line:match("^(%d%d%d%d)/(%d%d)/(%d%d) (%d%d):(%d%d):(%d%d)")
+        if not year then
+        year, month, day, hour, min, sec = line:match("^%[(%d%d%d%d)%-(%d%d)%-(%d%d)[T ](%d%d):(%d%d):(%d%d)")
+            if not year then
+                year, month, day, hour, min, sec = line:match("^%[(%d%d%d%d)/(%d%d)/(%d%d) (%d%d):(%d%d):(%d%d)")
+                if not year then
+                    return nil
+                end
+            end
+        end
     end
 
     return os.time({
@@ -1322,6 +1910,111 @@ function ResolvePathVariable(value, fallback)
     end
 
     return fallback or ""
+end
+
+function ResolveLogTarget(configuredFolder, configuredFile, synapse3Folder, synapse3File, synapse4Folder, synapse4File)
+    if configuredFile ~= "" then
+        return ResolveConfiguredLogTarget(configuredFolder, configuredFile)
+    end
+
+    if configuredFolder ~= "" then
+        local folderSource = DetectLogSource(configuredFolder)
+        if folderSource == "synapse4" then
+            local detectedFile = FindLatestSynapse4LogFile(configuredFolder)
+            return configuredFolder, detectedFile, "synapse4"
+        end
+
+        local detectedFile = configuredFolder .. "Razer Synapse 3.log"
+        return configuredFolder, detectedFile, "synapse3"
+    end
+
+    if synapse4File and synapse4File ~= "" and FileExists(synapse4File) then
+        return synapse4Folder, synapse4File, "synapse4"
+    end
+
+    if synapse3File and synapse3File ~= "" then
+        return synapse3Folder, synapse3File, "synapse3"
+    end
+
+    return configuredFolder ~= "" and configuredFolder or synapse3Folder, synapse3File, "synapse3"
+end
+
+function ResolveConfiguredLogTarget(configuredFolder, configuredFile)
+    local source = DetectLogSource(configuredFile)
+    local folder = configuredFolder
+    if folder == "" then
+        folder = GetParentFolder(configuredFile)
+    end
+
+    if source == "synapse4" and (configuredFile == "" or not FileExists(configuredFile)) then
+        local detectedFile = FindLatestSynapse4LogFile(folder)
+        if detectedFile and detectedFile ~= "" then
+            configuredFile = detectedFile
+        end
+    end
+
+    return folder, configuredFile, source
+end
+
+function GetParentFolder(path)
+    if not path or path == "" then
+        return ""
+    end
+
+    return path:match("^(.*[\\/])") or ""
+end
+
+function DetectLogSource(path)
+    local loweredPath = path and path:lower() or ""
+    if loweredPath:find("systray_systrayv", 1, true)
+        or loweredPath:find("\\razerappengine\\user data\\logs", 1, true) then
+        return "synapse4"
+    end
+
+    return "synapse3"
+end
+
+function IsSynapse4Source(path, source)
+    if source == "synapse4" then
+        return true
+    end
+
+    return DetectLogSource(path) == "synapse4"
+end
+
+function FindLatestSynapse4LogFile(folder)
+    local files = FindSynapse4LogFiles(folder)
+    return files[#files] or ""
+end
+
+function FindSynapse4LogFiles(folder)
+    if not folder or folder == "" then
+        return {}
+    end
+
+    local files = {}
+    local baseName = folder .. "systray_systrayv2.log"
+    if FileExists(baseName) then
+        table.insert(files, baseName)
+    end
+
+    local misses = 0
+    local maxFiles = 256
+    local missLimit = 32
+    for i = 1, maxFiles do
+        local candidate = folder .. "systray_systrayv2" .. tostring(i) .. ".log"
+        if FileExists(candidate) then
+            table.insert(files, candidate)
+            misses = 0
+        else
+            misses = misses + 1
+            if misses >= missLimit and i > 8 then
+                break
+            end
+        end
+    end
+
+    return files
 end
 
 function Midpoint(minValue, maxValue)
