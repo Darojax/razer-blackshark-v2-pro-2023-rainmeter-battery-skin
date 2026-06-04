@@ -39,6 +39,8 @@ It is designed for an always-visible desktop widget: small footprint, fast glanc
   - `C:\Users\<YourUser>\AppData\Local\Razer\Synapse3\Log\Razer Synapse 3.log` for Synapse 3
   - `C:\Users\<YourUser>\AppData\Local\Razer\RazerAppEngine\User Data\Logs\systray_systrayv2*.log` for Synapse 4
 - It only reads the tail of the live log to stay lightweight.
+- For Synapse 4, it scans all discovered `systray_systrayv2*.log` files and uses the newest headset snapshot found.
+- Synapse 4 can report `NoCharge_BatteryFull` even when the headset is not full, so the skin can infer charging from a recent rising battery percentage using `Synapse4ChargingInferenceHours`.
 - It can react more quickly to headset on/off transitions by checking for log changes frequently, while keeping the heavier battery parse on a slower cadence.
 - Battery-time estimation uses recent and longer-term local Synapse history, but now leans more heavily on broader history so short reconnect anomalies have less impact.
 - Only discharge sessions are considered for the estimate.

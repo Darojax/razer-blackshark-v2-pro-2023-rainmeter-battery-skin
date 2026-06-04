@@ -137,6 +137,7 @@ function RefreshSettings()
     local synapse3Folder = localAppData ~= "" and (localAppData .. "\\Razer\\Synapse3\\Log\\") or ""
     local synapse3File = synapse3Folder ~= "" and (synapse3Folder .. "Razer Synapse 3.log") or ""
     local synapse4Folder = localAppData ~= "" and (localAppData .. "\\Razer\\RazerAppEngine\\User Data\\Logs\\") or ""
+    local synapse4Files = FindSynapse4LogFiles(synapse4Folder)
     local synapse4File = FindLatestSynapse4LogFile(synapse4Folder)
     local configuredLogFolder = ResolvePathVariable(SKIN:GetVariable("LogFolder", ""), "")
     local configuredLogFile = ResolvePathVariable(SKIN:GetVariable("LogFile", ""), "")
@@ -160,6 +161,7 @@ function RefreshSettings()
         synapse3File = synapse3File,
         synapse4Folder = synapse4Folder,
         synapse4File = synapse4File,
+        synapse4Files = synapse4Files,
         devicePattern = string.lower(SKIN:GetVariable("DevicePattern", "BlackShark V2 Pro")),
         tailBytes = tonumber(SKIN:GetVariable("TailBytes", "524288")) or 524288,
         pollSeconds = tonumber(SKIN:GetVariable("PollSeconds", "60")) or 60,
@@ -181,6 +183,7 @@ function RefreshSettings()
         estimateMinSessionHours = tonumber(SKIN:GetVariable("EstimateMinSessionHours", "1")) or 1,
         estimateMaxRatePerHour = tonumber(SKIN:GetVariable("EstimateMaxRatePerHour", "6")) or 6,
         estimateOutlierRateFactor = tonumber(SKIN:GetVariable("EstimateOutlierRateFactor", "2.25")) or 2.25,
+        synapse4ChargingInferenceHours = tonumber(SKIN:GetVariable("Synapse4ChargingInferenceHours", "12")) or 12,
         previewFullChargeHours = tonumber(SKIN:GetVariable("PreviewFullChargeHours", "48")) or 48,
         showDeveloperPreviews = (tonumber(SKIN:GetVariable("ShowDeveloperPreviews", "0")) or 0) > 0,
         devMode = (tonumber(SKIN:GetVariable("DevMode", "0")) or 0) > 0,
@@ -301,10 +304,23 @@ end
 
 function ReadLatestBattery(path, devicePattern, tailBytes, logSource)
     if IsSynapse4Source(path, logSource) then
-        return ReadLatestBatteryV4(path, devicePattern, tailBytes)
+        return ReadLatestBatteryV4FromFiles(GetSynapse4ReadFiles(path), devicePattern, tailBytes)
     end
 
     return ReadLatestBatteryV3(path, devicePattern, tailBytes)
+end
+
+function GetSynapse4ReadFiles(path)
+    local files = settings and settings.synapse4Files or nil
+    if files and #files > 0 then
+        return files
+    end
+
+    if path and path ~= "" then
+        return { path }
+    end
+
+    return {}
 end
 
 function ReadLatestBatteryV3(path, devicePattern, tailBytes)
@@ -345,6 +361,39 @@ function ReadLatestBatteryV3(path, devicePattern, tailBytes)
     return latest
 end
 
+function ReadLatestBatteryV4FromFiles(files, devicePattern, tailBytes)
+    local latest = nil
+
+    for _, path in ipairs(files or {}) do
+        local reading = ReadLatestBatteryV4(path, devicePattern, tailBytes)
+        latest = PickNewerV4Reading(latest, reading)
+    end
+
+    ApplyV4ChargingInferenceFromFiles(files, latest, devicePattern)
+    return latest
+end
+
+function PickNewerV4Reading(current, candidate)
+    if not candidate then
+        return current
+    end
+
+    if not current then
+        return candidate
+    end
+
+    if (candidate.timestamp or 0) > (current.timestamp or 0) then
+        return candidate
+    end
+
+    if (candidate.timestamp or 0) == (current.timestamp or 0)
+        and (candidate.order or 0) > (current.order or 0) then
+        return candidate
+    end
+
+    return current
+end
+
 function ReadLatestBatteryV4(path, devicePattern, tailBytes)
     local content = ReadAll(path)
     if not content or content == "" then
@@ -352,11 +401,6 @@ function ReadLatestBatteryV4(path, devicePattern, tailBytes)
     end
 
     content = content:gsub("\r\n", "\n")
-    local directLatest = ParseV4LatestFromContent(content, devicePattern)
-    if directLatest then
-        return directLatest
-    end
-
     local latest = nil
     local latestSnapshot = nil
     local lineIndex = 0
@@ -369,6 +413,7 @@ function ReadLatestBatteryV4(path, devicePattern, tailBytes)
                 latestSnapshot = snapshot
                 if snapshot.reading then
                     latest = snapshot.reading
+                    latest.sourcePath = path
                 end
             end
         end
@@ -382,8 +427,21 @@ function ReadLatestBatteryV4(path, devicePattern, tailBytes)
                 timestamp = latestSnapshot.timestamp,
                 timestampText = latestSnapshot.timestampText,
                 order = latestSnapshot.order,
+                sourcePath = path,
             }
         end
+    end
+
+    if latest then
+        ApplyV4ChargingInference(content, latest, devicePattern)
+        return latest
+    end
+
+    local directLatest = ParseV4LatestFromContent(content, devicePattern)
+    if directLatest then
+        directLatest.sourcePath = path
+        ApplyV4ChargingInference(content, directLatest, devicePattern)
+        return directLatest
     end
 
     return latest
@@ -425,6 +483,71 @@ function ParseV4LatestFromContent(content, devicePattern)
         percent = tonumber(level),
         batteryState = MapV4BatteryState(chargingStatus),
     }
+end
+
+function ApplyV4ChargingInference(content, latest, devicePattern)
+    if not latest or latest.batteryState == "Charging" or latest.percent == nil or not latest.timestamp then
+        return
+    end
+
+    local previous = FindPreviousV4Reading(content, latest, devicePattern)
+    ApplyV4ChargingInferenceFromPrevious(latest, previous)
+end
+
+function ApplyV4ChargingInferenceFromFiles(files, latest, devicePattern)
+    if not latest or latest.batteryState == "Charging" or latest.percent == nil or not latest.timestamp then
+        return
+    end
+
+    local previous = nil
+    for _, path in ipairs(files or {}) do
+        local content = ReadAll(path)
+        if content and content ~= "" then
+            content = content:gsub("\r\n", "\n")
+            previous = PickNewerV4Reading(previous, FindPreviousV4Reading(content, latest, devicePattern))
+        end
+    end
+
+    ApplyV4ChargingInferenceFromPrevious(latest, previous)
+end
+
+function ApplyV4ChargingInferenceFromPrevious(latest, previous)
+    if not previous or previous.percent == nil or not previous.timestamp then
+        return
+    end
+
+    local maxAgeSeconds = math.max(1, settings and settings.synapse4ChargingInferenceHours or 12) * 3600
+    local ageSeconds = latest.timestamp - previous.timestamp
+    if ageSeconds < 0 or ageSeconds > maxAgeSeconds then
+        return
+    end
+
+    if latest.percent > previous.percent then
+        latest.batteryState = "Charging"
+        latest.inferredCharging = true
+    end
+end
+
+function FindPreviousV4Reading(content, latest, devicePattern)
+    local previous = nil
+    local lineIndex = 0
+
+    for line in content:gmatch("([^\n]*)\n?") do
+        lineIndex = lineIndex + 1
+        if line ~= "" then
+            local snapshot = ParseV4Snapshot(line, devicePattern, lineIndex)
+            local reading = snapshot and snapshot.reading or nil
+            if reading and reading.timestamp and reading.percent ~= nil then
+                local isOlder = reading.timestamp < latest.timestamp
+                    or (reading.timestamp == latest.timestamp and (reading.order or 0) < (latest.order or 0))
+                if isOlder then
+                    previous = PickNewerV4Reading(previous, reading)
+                end
+            end
+        end
+    end
+
+    return previous
 end
 
 function FindLastPlain(text, needle)
@@ -786,7 +909,7 @@ function ReadLatestLifecycleEventV3(path, devicePattern, tailBytes)
 end
 
 function ReadLatestLifecycleEventV4(path, devicePattern, tailBytes)
-    local snapshot = ReadLatestBatteryV4(path, devicePattern, tailBytes)
+    local snapshot = ReadLatestBatteryV4FromFiles(GetSynapse4ReadFiles(path), devicePattern, tailBytes)
     if not snapshot then
         return nil
     end
