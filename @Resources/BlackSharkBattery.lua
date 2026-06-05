@@ -369,7 +369,9 @@ function ReadLatestBatteryV4FromFiles(files, devicePattern, tailBytes)
         latest = PickNewerV4Reading(latest, reading)
     end
 
+    latest = RecoverV4DisconnectedReadingFromFiles(files, latest, devicePattern)
     ApplyV4ChargingInferenceFromFiles(files, latest, devicePattern)
+    ApplyV4OffBatteryFallbackFromFiles(files, latest, devicePattern)
     return latest
 end
 
@@ -529,6 +531,10 @@ function ApplyV4ChargingInferenceFromPrevious(latest, previous)
 end
 
 function FindPreviousV4Reading(content, latest, devicePattern)
+    return FindPreviousV4ReadingWithFilter(content, latest, devicePattern)
+end
+
+function FindPreviousV4ReadingWithFilter(content, latest, devicePattern, predicate)
     local previous = nil
     local lineIndex = 0
 
@@ -540,10 +546,79 @@ function FindPreviousV4Reading(content, latest, devicePattern)
             if reading and reading.timestamp and reading.percent ~= nil then
                 local isOlder = reading.timestamp < latest.timestamp
                     or (reading.timestamp == latest.timestamp and (reading.order or 0) < (latest.order or 0))
-                if isOlder then
+                if isOlder and ((not predicate) or predicate(reading)) then
                     previous = PickNewerV4Reading(previous, reading)
                 end
             end
+        end
+    end
+
+    return previous
+end
+
+function RecoverV4DisconnectedReadingFromFiles(files, latest, devicePattern)
+    if not latest or latest.present ~= false then
+        return latest
+    end
+
+    local previous = FindPreviousUsableV4ReadingFromFiles(files, latest, devicePattern)
+    if not previous then
+        return latest
+    end
+
+    local recovered = CloneReading(previous)
+    recovered.lifecycleEvent = {
+        status = "disconnected",
+        timestamp = latest.timestamp,
+        timestampText = latest.timestampText,
+        order = latest.order,
+    }
+    recovered.sourcePath = latest.sourcePath or previous.sourcePath
+    return recovered
+end
+
+function ApplyV4OffBatteryFallbackFromFiles(files, latest, devicePattern)
+    if not latest or not IsOffState(latest.batteryState) then
+        return
+    end
+
+    if latest.percent and latest.percent > 0 then
+        return
+    end
+
+    local previous = FindPreviousUsableV4ReadingFromFiles(files, latest, devicePattern)
+    if not previous or previous.percent == nil then
+        return
+    end
+
+    latest.percent = previous.percent
+    latest.recoveredPercent = true
+    latest.recoveredFromTimestamp = previous.timestamp
+    latest.recoveredFromTimestampText = previous.timestampText
+end
+
+function FindPreviousUsableV4ReadingFromFiles(files, latest, devicePattern)
+    local previous = FindPreviousV4ReadingFromFiles(files, latest, devicePattern, function(reading)
+        return reading.percent ~= nil and reading.percent > 0 and not IsOffState(reading.batteryState)
+    end)
+
+    if previous then
+        return previous
+    end
+
+    return FindPreviousV4ReadingFromFiles(files, latest, devicePattern, function(reading)
+        return reading.percent ~= nil and reading.percent > 0
+    end)
+end
+
+function FindPreviousV4ReadingFromFiles(files, latest, devicePattern, predicate)
+    local previous = nil
+
+    for _, path in ipairs(files or {}) do
+        local content = ReadAll(path)
+        if content and content ~= "" then
+            content = content:gsub("\r\n", "\n")
+            previous = PickNewerV4Reading(previous, FindPreviousV4ReadingWithFilter(content, latest, devicePattern, predicate))
         end
     end
 
