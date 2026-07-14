@@ -6,3 +6,7 @@ Desktop.ini
 
 *.tmp
 *.bak
+
+__pycache__/
+.pytest_cache/
+*.pyc

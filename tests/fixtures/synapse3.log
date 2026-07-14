@@ -1,0 +1,12 @@
+2026-07-14 09:00:00 Battery Get By Device Handle:
+Name: Razer BlackShark V2 Pro
+Battery Percentage: 73
+Battery State: NotCharging
+2026-07-14 09:05:00 Battery Get By Device Handle:
+Name: Some Other Device
+Battery Percentage: 12
+Battery State: Charging
+2026-07-14 09:10:00 Battery Get By Device Handle:
+Name: Razer BlackShark V2 Pro
+Battery Percentage: 72
+Battery State: NotCharging

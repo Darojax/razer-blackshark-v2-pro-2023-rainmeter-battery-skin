@@ -13,7 +13,7 @@ It is designed for an always-visible desktop widget: small footprint, fast glanc
 - Stale-data indicator with question mark
 - Explicit disconnected state that preserves the last known battery reading
 - Battery color bands: `0-10%` red, `11-20%` orange, `21-30%` yellow, `31-100%` green
-- Estimated remaining charge time based on robust local Synapse discharge history across short-, medium-, and longer-term usage
+- Adaptive remaining-charge estimate that starts with Razer's official 70-hour rating and progressively replaces it with local discharge history
 - Optional built-in preview states for live UI testing
 - Lightweight polling with a fast lifecycle check, slower battery polling, and longer-interval history rescans
 
@@ -38,12 +38,14 @@ It is designed for an always-visible desktop widget: small footprint, fast glanc
 - By default, the skin auto-detects the active Synapse log source:
   - `C:\Users\<YourUser>\AppData\Local\Razer\Synapse3\Log\Razer Synapse 3.log` for Synapse 3
   - `C:\Users\<YourUser>\AppData\Local\Razer\RazerAppEngine\User Data\Logs\systray_systrayv2*.log` for Synapse 4
-- It only reads the tail of the live log to stay lightweight.
+- It only reads a bounded tail of each live log during normal polling to stay lightweight; full files are reserved for infrequent history refreshes.
 - For Synapse 4, it scans all discovered `systray_systrayv2*.log` files and uses the newest headset snapshot found.
 - Synapse 4 can report `NoCharge_BatteryFull` even when the headset is not full, so the skin can infer charging from a recent rising battery percentage using `Synapse4ChargingInferenceHours`.
 - Synapse 4 `off` readings are treated as an offline headset state rather than as a live non-charging battery reading.
 - It can react more quickly to headset on/off transitions by checking for log changes frequently, while keeping the heavier battery parse on a slower cadence.
-- Battery-time estimation uses recent and longer-term local Synapse history, but now leans more heavily on broader history so short reconnect anomalies have less impact.
+- Battery-time estimation begins with Razer's official "up to 70 hours" specification when no useful local history exists.
+- As valid discharge sessions accumulate, the estimate blends in local observations according to evidence confidence. Once the history has sufficient battery drop, elapsed time, and sessions, the manufacturer baseline contributes nothing.
+- Recent, medium-term, and longer-term history are combined, with broader history weighted more heavily so short reconnect anomalies have less impact.
 - Only discharge sessions are considered for the estimate.
 - Long gaps, reconnect rebounds, and short outlier sessions are filtered out so the estimate is less sensitive to temporary percentage corrections.
 
@@ -80,10 +82,20 @@ Preview charge-time values use the configured `PreviewFullChargeHours` baseline 
 - `Stale` means the last Synapse battery reading is older than the configured `StaleMinutes` threshold.
 - `Disconnected` means Synapse reported the headset as removed or absent from the latest live device snapshot. In that state, the widget keeps the last known battery value but greys the whole display and replaces the lower line with `Disconnected`.
 - `Headset off` means Synapse 4 reported the headset power state as `off`. In that state, the widget keeps the last known battery value but greys the whole display.
-- When there is not enough discharge history yet, the widget displays `Charge left: Insufficient logs`.
+- When discharge history is sparse, the widget still shows the best available approximation and marks it with `?`; the tooltip indicates how much of the estimate comes from local history.
 - Live stale readings are marked as uncertain and do not show a live estimate.
 - Left-click the widget to force a refresh.
 - Right-click the widget to open the Synapse log folder or the skin folder.
+
+## Estimation Settings
+
+- `ManufacturerBatteryLifeHours=70` controls the initial full-charge prior. The default comes from [Razer's published "up to 70 hours" rating for the 2023 model](https://mysupport.razer.com/app/answers/detail/a_id/13060/).
+- `PreviewFullChargeHours` affects developer previews only.
+- Estimation automatically transitions from the manufacturer prior to measured local discharge behavior; no manual calibration is required.
+
+## Development Tests
+
+Install the development dependencies with `python -m pip install -r requirements-dev.txt`, then run `python -m pytest -q`.
 
 ## Repository Layout
 

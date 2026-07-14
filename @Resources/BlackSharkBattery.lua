@@ -10,10 +10,14 @@ local state = {
     staleHidden = true,
     historyEntries = nil,
     lastHistoryScan = 0,
-    lastObservedLogPath = "",
-    lastObservedLogSize = nil,
+    observedLogSignatures = {},
     lastLifecycleEvent = nil,
     lastReading = nil,
+    pendingLifecycleReading = nil,
+    pendingLifecycleAt = nil,
+    pendingLifecycleKind = nil,
+    autoLogFolder = "",
+    autoLogFile = "",
 }
 
 local palette = {
@@ -80,19 +84,27 @@ function RefreshNow()
                 timestampText = reading.timestampText,
                 order = reading.order,
             }
-            ApplyReading(quickReading)
+            local isPending = QueuePendingLifecycleReading(quickReading)
+            if not isPending then
+                ApplyReading(quickReading)
+            end
         else
             SetMissingState("No Synapse battery entry", "Open Synapse once with the headset connected")
         end
     elseif reading then
-        ApplyReading(reading)
+        local isPending = QueuePendingLifecycleReading(reading)
+        if not isPending or not state.lastReading then
+            ApplyReading(reading)
+        end
+    elseif state.lastReading then
+        ApplyLastKnownReadError("Synapse log temporarily unavailable")
     else
         SetMissingState("No Synapse battery entry", "Open Synapse once with the headset connected")
     end
 
     state.lastPollTime = os.time()
     state.lastLifecyclePollTime = state.lastPollTime
-    UpdateObservedLogSignature(settings.logFile)
+    UpdateObservedLogSignatures(GetObservedLogFiles())
 
     return state.value
 end
@@ -104,11 +116,20 @@ function CheckQuickLifecycle(now)
         return
     end
 
-    if not HasObservedLogChanged(settings.logFile) then
+    if state.pendingLifecycleReading and state.pendingLifecycleAt
+        and state.lastLifecyclePollTime >= state.pendingLifecycleAt then
+        local pendingReading = state.pendingLifecycleReading
+        ClearPendingLifecycleReading()
+        ApplyReading(pendingReading)
         return
     end
 
-    UpdateObservedLogSignature(settings.logFile)
+    local observedFiles = GetObservedLogFiles()
+    if not HaveObservedLogsChanged(observedFiles) then
+        return
+    end
+
+    UpdateObservedLogSignatures(observedFiles)
     local lifecycleEvent = ReadLatestLifecycleEvent(settings.logFile, settings.devicePattern, settings.lifecycleTailBytes)
     if not lifecycleEvent or IsSameLifecycleEvent(lifecycleEvent, state.lastLifecycleEvent) then
         return
@@ -117,18 +138,34 @@ function CheckQuickLifecycle(now)
     state.lastLifecycleEvent = CloneLifecycleEvent(lifecycleEvent)
 
     if lifecycleEvent.status == "connected" then
-        RefreshNow()
+        ClearPendingLifecycleReading()
+        if state.isDisconnected then
+            RefreshNow()
+        end
+        return
+    end
+
+    if lifecycleEvent.status == "off" then
+        if not state.isDisconnected then
+            RefreshNow()
+        end
         return
     end
 
     if lifecycleEvent.status == "disconnected" and state.lastReading then
+        if state.isDisconnected then
+            return
+        end
         local quickReading = CloneReading(state.lastReading)
         if not quickReading then
             return
         end
 
         quickReading.lifecycleEvent = CloneLifecycleEvent(lifecycleEvent)
-        ApplyReading(quickReading)
+        local isPending = QueuePendingLifecycleReading(quickReading)
+        if not isPending then
+            ApplyReading(quickReading)
+        end
     end
 end
 
@@ -137,10 +174,12 @@ function RefreshSettings()
     local synapse3Folder = localAppData ~= "" and (localAppData .. "\\Razer\\Synapse3\\Log\\") or ""
     local synapse3File = synapse3Folder ~= "" and (synapse3Folder .. "Razer Synapse 3.log") or ""
     local synapse4Folder = localAppData ~= "" and (localAppData .. "\\Razer\\RazerAppEngine\\User Data\\Logs\\") or ""
-    local synapse4Files = FindSynapse4LogFiles(synapse4Folder)
     local synapse4File = FindLatestSynapse4LogFile(synapse4Folder)
-    local configuredLogFolder = ResolvePathVariable(SKIN:GetVariable("LogFolder", ""), "")
-    local configuredLogFile = ResolvePathVariable(SKIN:GetVariable("LogFile", ""), "")
+    local requestedLogFolder = ResolvePathVariable(SKIN:GetVariable("LogFolder", ""), "")
+    local requestedLogFile = ResolvePathVariable(SKIN:GetVariable("LogFile", ""), "")
+    local configuredLogFolder = requestedLogFolder ~= state.autoLogFolder and requestedLogFolder or ""
+    local configuredLogFile = requestedLogFile ~= state.autoLogFile and requestedLogFile or ""
+    configuredLogFolder = EnsureTrailingSeparator(configuredLogFolder)
     local resolvedLogFolder, resolvedLogFile, resolvedLogSource = ResolveLogTarget(
         configuredLogFolder,
         configuredLogFile,
@@ -152,39 +191,54 @@ function RefreshSettings()
     local yellowThreshold = Clamp(tonumber(SKIN:GetVariable("YellowThreshold", "30")) or 30, 0, 100)
     local orangeThreshold = Clamp(tonumber(SKIN:GetVariable("OrangeThreshold", "20")) or 20, 0, yellowThreshold)
     local redThreshold = Clamp(tonumber(SKIN:GetVariable("RedThreshold", "10")) or 10, 0, orangeThreshold)
+    local devicePattern = Trim(string.lower(SKIN:GetVariable("DevicePattern", "BlackShark V2 Pro")))
+    if devicePattern == "" then
+        devicePattern = "blackshark v2 pro"
+    end
+    resolvedLogFolder = EnsureTrailingSeparator(resolvedLogFolder)
+    local synapse4Files = {}
+    if resolvedLogSource == "synapse4" then
+        if configuredLogFile ~= "" then
+            synapse4Files = { resolvedLogFile }
+        else
+            synapse4Files = FindSynapse4LogFiles(resolvedLogFolder)
+        end
+    end
 
     settings = {
         logFolder = resolvedLogFolder,
         logFile = resolvedLogFile,
         logSource = resolvedLogSource,
+        logFileIsConfigured = configuredLogFile ~= "",
         synapse3Folder = synapse3Folder,
         synapse3File = synapse3File,
         synapse4Folder = synapse4Folder,
         synapse4File = synapse4File,
         synapse4Files = synapse4Files,
-        devicePattern = string.lower(SKIN:GetVariable("DevicePattern", "BlackShark V2 Pro")),
-        tailBytes = tonumber(SKIN:GetVariable("TailBytes", "524288")) or 524288,
-        pollSeconds = tonumber(SKIN:GetVariable("PollSeconds", "60")) or 60,
-        lifecyclePollSeconds = tonumber(SKIN:GetVariable("LifecyclePollSeconds", "5")) or 5,
-        lifecycleTailBytes = tonumber(SKIN:GetVariable("LifecycleTailBytes", "32768")) or 32768,
-        staleMinutes = tonumber(SKIN:GetVariable("StaleMinutes", "180")) or 180,
-        disconnectDebounceSeconds = tonumber(SKIN:GetVariable("DisconnectDebounceSeconds", "15")) or 15,
-        historyDays = tonumber(SKIN:GetVariable("HistoryDays", "90")) or 90,
-        historyRefreshHours = tonumber(SKIN:GetVariable("HistoryRefreshHours", "6")) or 6,
+        devicePattern = devicePattern,
+        tailBytes = math.floor(Clamp(tonumber(SKIN:GetVariable("TailBytes", "524288")) or 524288, 4096, 16777216)),
+        pollSeconds = Clamp(tonumber(SKIN:GetVariable("PollSeconds", "60")) or 60, 0, 86400),
+        lifecyclePollSeconds = Clamp(tonumber(SKIN:GetVariable("LifecyclePollSeconds", "5")) or 5, 0, 3600),
+        lifecycleTailBytes = math.floor(Clamp(tonumber(SKIN:GetVariable("LifecycleTailBytes", "32768")) or 32768, 4096, 1048576)),
+        staleMinutes = Clamp(tonumber(SKIN:GetVariable("StaleMinutes", "180")) or 180, 1, 525600),
+        disconnectDebounceSeconds = Clamp(tonumber(SKIN:GetVariable("DisconnectDebounceSeconds", "15")) or 15, 0, 300),
+        historyDays = Clamp(tonumber(SKIN:GetVariable("HistoryDays", "90")) or 90, 1, 3650),
+        historyRefreshHours = Clamp(tonumber(SKIN:GetVariable("HistoryRefreshHours", "6")) or 6, 0.25, 168),
         yellowThreshold = yellowThreshold,
         orangeThreshold = orangeThreshold,
         redThreshold = redThreshold,
-        estimateRecentHours = tonumber(SKIN:GetVariable("EstimateRecentHours", "24")) or 24,
-        estimateMediumHours = tonumber(SKIN:GetVariable("EstimateMediumHours", "336")) or 336,
-        estimateLongHours = tonumber(SKIN:GetVariable("EstimateLongHours", "2160")) or 2160,
-        estimateMaxGapHours = tonumber(SKIN:GetVariable("EstimateMaxGapHours", "3")) or 3,
-        estimateMinTotalDrop = tonumber(SKIN:GetVariable("EstimateMinTotalDrop", "3")) or 3,
-        estimateMinSessionDrop = tonumber(SKIN:GetVariable("EstimateMinSessionDrop", "3")) or 3,
-        estimateMinSessionHours = tonumber(SKIN:GetVariable("EstimateMinSessionHours", "1")) or 1,
-        estimateMaxRatePerHour = tonumber(SKIN:GetVariable("EstimateMaxRatePerHour", "6")) or 6,
-        estimateOutlierRateFactor = tonumber(SKIN:GetVariable("EstimateOutlierRateFactor", "2.25")) or 2.25,
-        synapse4ChargingInferenceHours = tonumber(SKIN:GetVariable("Synapse4ChargingInferenceHours", "12")) or 12,
-        previewFullChargeHours = tonumber(SKIN:GetVariable("PreviewFullChargeHours", "48")) or 48,
+        estimateRecentHours = Clamp(tonumber(SKIN:GetVariable("EstimateRecentHours", "24")) or 24, 1, 87600),
+        estimateMediumHours = Clamp(tonumber(SKIN:GetVariable("EstimateMediumHours", "336")) or 336, 1, 87600),
+        estimateLongHours = Clamp(tonumber(SKIN:GetVariable("EstimateLongHours", "2160")) or 2160, 1, 87600),
+        estimateMaxGapHours = Clamp(tonumber(SKIN:GetVariable("EstimateMaxGapHours", "3")) or 3, 0.05, 168),
+        estimateMinTotalDrop = Clamp(tonumber(SKIN:GetVariable("EstimateMinTotalDrop", "3")) or 3, 1, 100),
+        estimateMinSessionDrop = Clamp(tonumber(SKIN:GetVariable("EstimateMinSessionDrop", "3")) or 3, 1, 100),
+        estimateMinSessionHours = Clamp(tonumber(SKIN:GetVariable("EstimateMinSessionHours", "1")) or 1, 0.05, 168),
+        estimateMaxRatePerHour = Clamp(tonumber(SKIN:GetVariable("EstimateMaxRatePerHour", "6")) or 6, 0.1, 100),
+        estimateOutlierRateFactor = Clamp(tonumber(SKIN:GetVariable("EstimateOutlierRateFactor", "2.25")) or 2.25, 1, 20),
+        synapse4ChargingInferenceHours = Clamp(tonumber(SKIN:GetVariable("Synapse4ChargingInferenceHours", "12")) or 12, 0.1, 168),
+        manufacturerBatteryLifeHours = Clamp(tonumber(SKIN:GetVariable("ManufacturerBatteryLifeHours", "70")) or 70, 1, 1000),
+        previewFullChargeHours = Clamp(tonumber(SKIN:GetVariable("PreviewFullChargeHours", "70")) or 70, 1, 1000),
         showDeveloperPreviews = (tonumber(SKIN:GetVariable("ShowDeveloperPreviews", "0")) or 0) > 0,
         devMode = (tonumber(SKIN:GetVariable("DevMode", "0")) or 0) > 0,
         devBatteryPercent = Clamp(tonumber(SKIN:GetVariable("DevBatteryPercent", "75")) or 75, 0, 100),
@@ -197,6 +251,8 @@ function RefreshSettings()
 
     SetVariable("LogFolder", settings.logFolder)
     SetVariable("LogFile", settings.logFile)
+    state.autoLogFolder = settings.logFolder
+    state.autoLogFile = settings.logFile
     ConfigureDeveloperContextMenu()
 end
 
@@ -311,6 +367,14 @@ function ReadLatestBattery(path, devicePattern, tailBytes, logSource)
 end
 
 function GetSynapse4ReadFiles(path)
+    if settings and settings.logSource == "synapse4" and not settings.logFileIsConfigured then
+        local discovered = FindSynapse4LogFiles(settings.logFolder)
+        if #discovered > 0 then
+            settings.synapse4Files = discovered
+            return discovered
+        end
+    end
+
     local files = settings and settings.synapse4Files or nil
     if files and #files > 0 then
         return files
@@ -397,7 +461,7 @@ function PickNewerV4Reading(current, candidate)
 end
 
 function ReadLatestBatteryV4(path, devicePattern, tailBytes)
-    local content = ReadAll(path)
+    local content = ReadTail(path, tailBytes)
     if not content or content == "" then
         return nil
     end
@@ -503,7 +567,7 @@ function ApplyV4ChargingInferenceFromFiles(files, latest, devicePattern)
 
     local previous = nil
     for _, path in ipairs(files or {}) do
-        local content = ReadAll(path)
+        local content = ReadTail(path, settings and settings.tailBytes or 524288)
         if content and content ~= "" then
             content = content:gsub("\r\n", "\n")
             previous = PickNewerV4Reading(previous, FindPreviousV4Reading(content, latest, devicePattern))
@@ -615,7 +679,7 @@ function FindPreviousV4ReadingFromFiles(files, latest, devicePattern, predicate)
     local previous = nil
 
     for _, path in ipairs(files or {}) do
-        local content = ReadAll(path)
+        local content = ReadTail(path, settings and settings.tailBytes or 524288)
         if content and content ~= "" then
             content = content:gsub("\r\n", "\n")
             previous = PickNewerV4Reading(previous, FindPreviousV4ReadingWithFilter(content, latest, devicePattern, predicate))
@@ -988,14 +1052,23 @@ function ReadLatestLifecycleEventV3(path, devicePattern, tailBytes)
 end
 
 function ReadLatestLifecycleEventV4(path, devicePattern, tailBytes)
-    local snapshot = ReadLatestBatteryV4FromFiles(GetSynapse4ReadFiles(path), devicePattern, tailBytes)
+    local snapshot = ReadLatestV4SnapshotFromFiles(GetSynapse4ReadFiles(path), devicePattern, tailBytes)
     if not snapshot then
         return nil
     end
 
-    if snapshot.present == false then
+    if not snapshot.hasDevice then
         return {
             status = "disconnected",
+            timestamp = snapshot.timestamp,
+            timestampText = snapshot.timestampText,
+            order = snapshot.order or 0,
+        }
+    end
+
+    if snapshot.reading and IsOffState(snapshot.reading.batteryState) then
+        return {
+            status = "off",
             timestamp = snapshot.timestamp,
             timestampText = snapshot.timestampText,
             order = snapshot.order or 0,
@@ -1010,19 +1083,26 @@ function ReadLatestLifecycleEventV4(path, devicePattern, tailBytes)
     }
 end
 
-function ReadAll(path)
-    if not path or path == "" then
-        return nil
+function ReadLatestV4SnapshotFromFiles(files, devicePattern, tailBytes)
+    local latest = nil
+    for _, sourcePath in ipairs(files or {}) do
+        local content = ReadTail(sourcePath, tailBytes)
+        if content and content ~= "" then
+            content = content:gsub("\r\n", "\n")
+            local lineIndex = 0
+            for line in content:gmatch("([^\n]*)\n?") do
+                lineIndex = lineIndex + 1
+                local snapshot = ParseV4Snapshot(line, devicePattern, lineIndex)
+                if snapshot and ((not latest)
+                    or snapshot.timestamp > latest.timestamp
+                    or (snapshot.timestamp == latest.timestamp and snapshot.order > latest.order)) then
+                    latest = snapshot
+                    latest.sourcePath = sourcePath
+                end
+            end
+        end
     end
-
-    local file = io.open(path, "rb")
-    if not file then
-        return nil
-    end
-
-    local content = file:read("*a")
-    file:close()
-    return content
+    return latest
 end
 
 function CloneLifecycleEvent(event)
@@ -1051,8 +1131,57 @@ function CloneReading(reading)
         batteryState = reading.batteryState,
         isPreview = reading.isPreview,
         order = reading.order,
+        sourcePath = reading.sourcePath,
         lifecycleEvent = CloneLifecycleEvent(reading.lifecycleEvent),
     }
+end
+
+function ClearPendingLifecycleReading()
+    state.pendingLifecycleReading = nil
+    state.pendingLifecycleAt = nil
+    state.pendingLifecycleKind = nil
+end
+
+function QueuePendingLifecycleReading(reading)
+    if not reading then
+        ClearPendingLifecycleReading()
+        return false
+    end
+
+    local transitionTimestamp = nil
+    local transitionKind = nil
+    if IsOffState(reading.batteryState) then
+        transitionTimestamp = reading.timestamp
+        transitionKind = "off"
+    elseif reading.lifecycleEvent and reading.lifecycleEvent.status == "disconnected" then
+        local eventTimestamp = reading.lifecycleEvent.timestamp or 0
+        local eventOrder = reading.lifecycleEvent.order or 0
+        if eventTimestamp > (reading.timestamp or 0)
+            or (eventTimestamp == (reading.timestamp or 0) and eventOrder > (reading.order or 0)) then
+            transitionTimestamp = eventTimestamp
+            transitionKind = "disconnected"
+        end
+    end
+
+    if not transitionTimestamp then
+        ClearPendingLifecycleReading()
+        return false
+    end
+
+    if state.pendingLifecycleReading and state.pendingLifecycleKind == transitionKind then
+        return true
+    end
+
+    local applyAt = transitionTimestamp + math.max(0, settings.disconnectDebounceSeconds or 0)
+    if applyAt <= os.time() then
+        ClearPendingLifecycleReading()
+        return false
+    end
+
+    state.pendingLifecycleReading = CloneReading(reading)
+    state.pendingLifecycleAt = applyAt
+    state.pendingLifecycleKind = transitionKind
+    return true
 end
 
 function IsSameLifecycleEvent(left, right)
@@ -1151,6 +1280,20 @@ function SetMissingState(status, timestampText)
     RefreshSkin()
 end
 
+function ApplyLastKnownReadError(message)
+    local lastReading = CloneReading(state.lastReading)
+    if not lastReading then
+        SetMissingState("No Synapse battery entry", message)
+        return
+    end
+
+    ApplyReading(lastReading)
+    local statusText = message or "Synapse log temporarily unavailable"
+    SetVariable("BatteryTimestamp", statusText .. "; showing last reading")
+    SetVariable("BatteryTooltip", string.format("%d%%\n%s\nLast Synapse reading: %s\nLog file: %s", state.value, statusText, lastReading.timestampText or "Unknown", settings.logFile))
+    RefreshSkin()
+end
+
 function RefreshSkin()
     SKIN:Bang("!UpdateMeter", "*")
     SKIN:Bang("!Redraw")
@@ -1215,22 +1358,47 @@ function GetFileSize(path)
     return size
 end
 
-function HasObservedLogChanged(path)
-    local currentSize = GetFileSize(path)
-    if currentSize == nil then
-        return false
+function GetObservedLogFiles()
+    if not settings then
+        return {}
     end
 
-    if state.lastObservedLogPath ~= path then
-        return true
+    if settings.logSource == "synapse4" then
+        if settings.logFileIsConfigured then
+            return settings.logFile ~= "" and { settings.logFile } or {}
+        end
+        return FindSynapse4LogFiles(settings.logFolder)
     end
 
-    return state.lastObservedLogSize ~= currentSize
+    return settings.logFile ~= "" and { settings.logFile } or {}
 end
 
-function UpdateObservedLogSignature(path)
-    state.lastObservedLogPath = path or ""
-    state.lastObservedLogSize = GetFileSize(path)
+function BuildObservedLogSignatures(files)
+    local signatures = {}
+    for _, path in ipairs(files or {}) do
+        signatures[path] = GetFileSize(path) or -1
+    end
+    return signatures
+end
+
+function HaveObservedLogsChanged(files)
+    local current = BuildObservedLogSignatures(files)
+    local previous = state.observedLogSignatures or {}
+    for path, size in pairs(current) do
+        if previous[path] ~= size then
+            return true
+        end
+    end
+    for path, _ in pairs(previous) do
+        if current[path] == nil then
+            return true
+        end
+    end
+    return false
+end
+
+function UpdateObservedLogSignatures(files)
+    state.observedLogSignatures = BuildObservedLogSignatures(files)
 end
 
 function GetEstimate(reading, isStale)
@@ -1253,34 +1421,40 @@ function GetEstimate(reading, isStale)
 
     EnsureHistoryEntries(reading)
     local entries = state.historyEntries or {}
-    if #entries < 3 then
-        local preliminary = GetPreliminaryEstimate(entries, reading)
-        if preliminary then
-            return preliminary
-        end
-
-        return GetBaselineEstimate(reading)
-    end
-
     local recent = CalculateDischargeRate(entries, settings.estimateRecentHours)
     local medium = CalculateDischargeRate(entries, settings.estimateMediumHours)
     local long = CalculateDischargeRate(entries, settings.estimateLongHours)
-    local rate = CombineRates(recent, medium, long)
-    if not rate or rate <= 0 then
-        local preliminary = GetPreliminaryEstimate(entries, reading)
-        if preliminary then
-            return preliminary
-        end
+    local observed = CombineRateEstimate(recent, medium, long)
+    local isPreliminary = false
 
+    if not observed then
+        recent = CalculatePreliminaryDischargeRate(entries, settings.estimateRecentHours)
+        medium = CalculatePreliminaryDischargeRate(entries, settings.estimateMediumHours)
+        long = CalculatePreliminaryDischargeRate(entries, settings.estimateLongHours)
+        observed = CombineRateEstimate(recent, medium, long)
+        isPreliminary = observed ~= nil
+        if observed then
+            observed.confidence = math.min(0.75, observed.confidence)
+        end
+    end
+
+    if not observed or not observed.rate or observed.rate <= 0 then
         return GetBaselineEstimate(reading)
     end
 
-    local hoursRemaining = reading.percent / rate
+    local manufacturerRate = 100 / settings.manufacturerBatteryLifeHours
+    local localWeight = Clamp(observed.confidence or 0, 0, 1)
+    local blendedRate = (observed.rate * localWeight) + (manufacturerRate * (1 - localWeight))
+    local hoursRemaining = reading.percent / blendedRate
+    local localPercent = math.floor((localWeight * 100) + 0.5)
     return {
         available = true,
         hours = hoursRemaining,
-        rate = rate,
-        text = string.format("Estimated battery use left: ~%s", FormatHours(hoursRemaining)),
+        rate = blendedRate,
+        observedRate = observed.rate,
+        localWeight = localWeight,
+        preliminary = isPreliminary or localWeight < 0.999,
+        text = string.format("Adaptive estimate: ~%s (%d%% local history)", FormatHours(hoursRemaining), localPercent),
     }
 end
 
@@ -1292,32 +1466,37 @@ function GetPreliminaryEstimate(entries, reading)
     local recent = CalculatePreliminaryDischargeRate(entries, settings.estimateRecentHours)
     local medium = CalculatePreliminaryDischargeRate(entries, settings.estimateMediumHours)
     local long = CalculatePreliminaryDischargeRate(entries, settings.estimateLongHours)
-    local rate = CombineRates(recent, medium, long)
-    if not rate or rate <= 0 then
+    local observed = CombineRateEstimate(recent, medium, long)
+    if not observed or not observed.rate or observed.rate <= 0 then
         return nil
     end
 
+    observed.confidence = math.min(0.75, observed.confidence)
+    local manufacturerRate = 100 / settings.manufacturerBatteryLifeHours
+    local rate = (observed.rate * observed.confidence) + (manufacturerRate * (1 - observed.confidence))
     local hoursRemaining = reading.percent / rate
     return {
         available = true,
         hours = hoursRemaining,
         rate = rate,
         preliminary = true,
-        text = string.format("Preliminary charge estimate: ~%s", FormatHours(hoursRemaining)),
+        localWeight = observed.confidence,
+        text = string.format("Adaptive estimate: ~%s (%d%% local history)", FormatHours(hoursRemaining), math.floor(observed.confidence * 100 + 0.5)),
     }
 end
 
 function GetBaselineEstimate(reading)
-    local fullHours = math.max(1, settings.previewFullChargeHours or 48)
+    local fullHours = math.max(1, settings.manufacturerBatteryLifeHours or 70)
     local percent = Clamp(reading.percent or 0, 0, 100)
     local hoursRemaining = (percent / 100) * fullHours
 
     return {
         available = true,
         hours = hoursRemaining,
-        baseline = true,
+        manufacturerBaseline = true,
         preliminary = true,
-        text = string.format("Baseline charge estimate: ~%s", FormatHours(hoursRemaining)),
+        localWeight = 0,
+        text = string.format("Manufacturer-based estimate: ~%s (local history still collecting)", FormatHours(hoursRemaining)),
     }
 end
 
@@ -1393,7 +1572,14 @@ end
 
 function GatherHistoryFilesV4()
     local files = {}
-    local folder = settings.synapse4Folder or settings.logFolder or ""
+    if settings.logFileIsConfigured then
+        if FileExists(settings.logFile) then
+            table.insert(files, settings.logFile)
+        end
+        return files
+    end
+
+    local folder = settings.logFolder or ""
     if folder == "" then
         if FileExists(settings.logFile) then
             table.insert(files, settings.logFile)
@@ -1607,8 +1793,14 @@ function CalculatePreliminaryDischargeRate(entries, windowHours)
 end
 
 function CombineRates(recent, medium, long)
+    local estimate = CombineRateEstimate(recent, medium, long)
+    return estimate and estimate.rate or nil
+end
+
+function CombineRateEstimate(recent, medium, long)
     local weightedRate = 0
     local totalWeight = 0
+    local strongestConfidence = 0
 
     local function addRate(stats, baseWeight)
         local confidence = GetRateConfidence(stats)
@@ -1616,6 +1808,7 @@ function CombineRates(recent, medium, long)
         if stats and stats.rate and stats.rate > 0 and weight > 0 then
             weightedRate = weightedRate + (stats.rate * weight)
             totalWeight = totalWeight + weight
+            strongestConfidence = math.max(strongestConfidence, confidence)
         end
     end
 
@@ -1625,18 +1818,21 @@ function CombineRates(recent, medium, long)
 
     if totalWeight <= 0 then
         if long and long.rate and long.rate > 0 then
-            return long.rate
+            return { rate = long.rate, confidence = GetRateConfidence(long) }
         end
         if medium and medium.rate and medium.rate > 0 then
-            return medium.rate
+            return { rate = medium.rate, confidence = GetRateConfidence(medium) }
         end
         if recent and recent.rate and recent.rate > 0 then
-            return recent.rate
+            return { rate = recent.rate, confidence = GetRateConfidence(recent) }
         end
         return nil
     end
 
-    return weightedRate / totalWeight
+    return {
+        rate = weightedRate / totalWeight,
+        confidence = Clamp(strongestConfidence, 0, 1),
+    }
 end
 
 function CollectDischargeSessions(entries, windowHours)
@@ -2211,7 +2407,38 @@ end
 
 function FindLatestSynapse4LogFile(folder)
     local files = FindSynapse4LogFiles(folder)
-    return files[#files] or ""
+    local latestPath = ""
+    local latestTimestamp = -1
+    local latestSize = -1
+    for _, path in ipairs(files) do
+        local timestamp = GetLatestLogTimestamp(path, 65536) or -1
+        local size = GetFileSize(path) or -1
+        if timestamp > latestTimestamp or (timestamp == latestTimestamp and size > latestSize) then
+            latestPath = path
+            latestTimestamp = timestamp
+            latestSize = size
+        end
+    end
+    return latestPath
+end
+
+function GetLatestLogTimestamp(path, tailBytes)
+    local content = ReadTail(path, tailBytes)
+    if not content or content == "" then
+        return nil
+    end
+
+    content = content:gsub("\r\n", "\n")
+    local latest = nil
+    for line in content:gmatch("([^\n]*)\n?") do
+        if IsTimestampLine(line) then
+            local timestamp = ParseTimestamp(line)
+            if timestamp and ((not latest) or timestamp > latest) then
+                latest = timestamp
+            end
+        end
+    end
+    return latest
 end
 
 function FindSynapse4LogFiles(folder)
@@ -2262,4 +2489,16 @@ function Clamp(value, minValue, maxValue)
     end
 
     return value
+end
+
+function Trim(value)
+    return (value or ""):match("^%s*(.-)%s*$")
+end
+
+function EnsureTrailingSeparator(path)
+    path = Trim(path)
+    if path == "" or path:match("[\\/]$") then
+        return path
+    end
+    return path .. "\\"
 end
